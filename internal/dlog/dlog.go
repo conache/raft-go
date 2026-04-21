@@ -3,13 +3,15 @@ package dlog
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 )
 
 var debugStart time.Time
 
-// Debugging
-const Debug = false
+// Debug controls whether Dlog / DPrintf emit output. Set DEBUG_TRACE=1 in
+// the environment to enable.
+var Debug = os.Getenv("DEBUG_TRACE") == "1"
 
 type LogTopic string
 

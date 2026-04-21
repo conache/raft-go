@@ -25,11 +25,11 @@ raft-go/
 ├── server/             PUBLIC  wiring + CLI      ⬜ stub
 │
 ├── internal/
-│   ├── consensus/      PRIVATE Raft algorithm    ⬜ stub
+│   ├── consensus/      PRIVATE Raft algorithm    ✅ (unsplit, no tests)
 │   ├── dlog/           PRIVATE debug logger      ✅
 │   └── testcluster/    PRIVATE cluster harness   ⬜
 │
-└── tools/dslogs/       DEV     log parser        ✅
+└── tools/dslogs.py     DEV     log parser        ✅
 ```
 
 ## Dependency diagram
@@ -75,7 +75,7 @@ raft-go/
   └──────┘      └────┘                      └──────┘└──────┘
 
 Side utilities:
-  internal/dlog         tools/dslogs
+  internal/dlog         tools/dslogs.py
   internal/testcluster  server
 ```
 
@@ -153,5 +153,5 @@ instances to a shared `transport/memory` mesh and per-node `storage/memory`
 stores, and provides assertion helpers (checkOneLeader, one, wait,
 checkLogs).
 
-### `tools/dslogs` (dev)
+### `tools/dslogs.py` (dev)
 Python TUI for coloring and filtering Dlog output into per-peer columns.
