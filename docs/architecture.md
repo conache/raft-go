@@ -17,9 +17,8 @@ together, and what state each piece is in. Update as the project evolves.
 raft-go/
 ├── go.mod · README.md                            ✅
 │
-├── raftpb/             PUBLIC  wire types        ⬜ stub
 ├── rsm/                PUBLIC  hashicorp-style   ⬜ stub
-├── transport/          PUBLIC  Peer interface    ✅
+├── transport/          PUBLIC  Peer interface + wire types   ✅
 │   └── memory/         PUBLIC  in-process mesh   ✅
 ├── storage/            PUBLIC  Store interface   ✅
 │   └── memory/         PUBLIC  in-memory store   ✅
@@ -60,20 +59,20 @@ raft-go/
                   │   log replication,  │
                   │   snapshot install, │
                   │   persistence)      │
-                  └──┬────────┬─────┬──┘
-                     │        │     │
-     ┌───────────────┘        │     └──────────────┐
-     ▼                        ▼                    ▼
- ┌─────────────┐         ┌────────────┐      ┌──────────┐
- │ transport   │         │ storage    │      │ raftpb   │
- │ .Peer       │         │ .Store     │      │ (wire    │
- │ (interface) │         │ (interface)│      │  types)  │
- └──┬───────┬──┘         └──┬──────┬──┘      └──────────┘
-    │       │               │      │
-    ▼       ▼               ▼      ▼
-  ┌──────┐┌────┐         ┌──────┐┌──────┐
-  │memory││grpc│         │memory││ file │
-  └──────┘└────┘         └──────┘└──────┘
+                  └──┬─────────────┬───┘
+                     │             │
+     ┌───────────────┘             └──────────────┐
+     ▼                                            ▼
+ ┌────────────────────┐                     ┌────────────┐
+ │ transport          │                     │ storage    │
+ │ .Peer (interface)  │                     │ .Store     │
+ │ + wire types       │                     │ (interface)│
+ └──┬──────────────┬──┘                     └──┬──────┬──┘
+    │              │                           │      │
+    ▼              ▼                           ▼      ▼
+  ┌──────┐      ┌────┐                      ┌──────┐┌──────┐
+  │memory│      │grpc│                      │memory││ file │
+  └──────┘      └────┘                      └──────┘└──────┘
 
 Side utilities:
   internal/dlog         tools/dslogs
@@ -113,18 +112,16 @@ user sees response via Future.Response()
 
 ## Layer responsibilities
 
-### `raftpb` (public)
-Hand-written Go structs for wire messages shared between consensus and any
-transport: `LogEntry`, `RequestVoteArgs/Reply`, `AppendEntriesArgs/Reply`,
-`InstallSnapshotArgs/Reply`. Isolated in its own package to avoid circular
-imports between consensus and transport implementations, and to give any
-third-party transport a stable type vocabulary to target.
-
 ### `transport` (public)
-A single interface, `Peer`, with one method: `Call(ctx, method, args, reply)
-error`. Consensus uses this to send Raft RPCs to other peers. Implementations
-plug in behind this interface — `transport/memory` for tests, `transport/grpc`
-for production.
+Two things in one package:
+
+1. The `Peer` interface, with one method: `Call(ctx, method, args, reply) error`.
+   Consensus uses this to send Raft RPCs to other peers. Implementations plug in
+   behind it — `transport/memory` for tests, `transport/grpc` for production.
+2. Hand-written Go structs for the wire messages the interface carries:
+   `LogEntry`, `RequestVoteArgs/Reply`, `AppendEntriesArgs/Reply`,
+   `InstallSnapshotArgs/Reply`. Any third-party transport implementation
+   imports the same types.
 
 ### `storage` (public)
 A single interface, `Store`, with four methods: `Save`, `ReadState`,
