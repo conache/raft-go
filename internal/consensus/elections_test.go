@@ -68,10 +68,12 @@ func TestElectionStallsWithoutQuorum(t *testing.T) {
 
 	leader1 := c.CheckOneLeader()
 
-	// Disconnect the leader and one other peer: only one peer remains, no quorum.
+	// Disconnect the leader and one other peer: only one peer remains, no
+	// quorum. Disconnect the non-leader first so the cluster can't hold an
+	// election in the window between the two calls.
 	other := (leader1 + 1) % 3
-	c.Disconnect(leader1)
 	c.Disconnect(other)
+	c.Disconnect(leader1)
 
 	// Wait long enough that any in-flight election times out without a quorum.
 	time.Sleep(2 * 500 * time.Millisecond)
@@ -135,10 +137,11 @@ func TestElectionEndToEndRecovery(t *testing.T) {
 	leader2 := c.CheckOneLeader()
 
 	// Take the new leader and one other peer offline — only one peer
-	// remains, so no quorum and no leader.
+	// remains, so no quorum and no leader. Disconnect the non-leader first
+	// so an election can't fire between the two calls.
 	other := (leader2 + 1) % 3
-	c.Disconnect(leader2)
 	c.Disconnect(other)
+	c.Disconnect(leader2)
 	time.Sleep(2 * 500 * time.Millisecond)
 	c.CheckNoLeader()
 

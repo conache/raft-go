@@ -5,9 +5,11 @@ package testcluster
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,12 @@ const (
 	checkLeaderInterval = 100 * time.Millisecond
 )
 
+const (
+	oneOuterTimeout = 10 * time.Second
+	oneInnerTimeout = 2 * time.Second
+	onePollInterval = 20 * time.Millisecond
+)
+
 // Cluster is an n-node Raft cluster backed by an in-memory mesh.
 type Cluster struct {
 	t         *testing.T
@@ -38,21 +46,30 @@ type Cluster struct {
 	connected []bool
 	done      chan struct{}
 	drainWG   sync.WaitGroup
+
+	appliedMu       sync.Mutex
+	appliedCommands []map[int]any
+
+	opsCount atomic.Int64
 }
 
 // New builds and starts an n-node cluster. Caller must defer Shutdown.
 func New(t *testing.T, n int) *Cluster {
 	t.Helper()
 	c := &Cluster{
-		t:         t,
-		n:         n,
-		mesh:      memtransport.NewMesh(n),
-		stores:    make([]*memstorage.Store, n),
-		nodes:     make([]*consensus.Node, n),
-		applyChs:  make([]chan consensus.ApplyMsg, n),
-		connected: make([]bool, n),
-		done:      make(chan struct{}),
-		startedAt: time.Now(),
+		t:               t,
+		n:               n,
+		mesh:            memtransport.NewMesh(n),
+		stores:          make([]*memstorage.Store, n),
+		nodes:           make([]*consensus.Node, n),
+		applyChs:        make([]chan consensus.ApplyMsg, n),
+		connected:       make([]bool, n),
+		done:            make(chan struct{}),
+		startedAt:       time.Now(),
+		appliedCommands: make([]map[int]any, n),
+	}
+	for i := range n {
+		c.appliedCommands[i] = make(map[int]any)
 	}
 
 	// Create all nodes first; register handlers after so no peer can issue
@@ -69,7 +86,7 @@ func New(t *testing.T, n int) *Cluster {
 		c.connected[i] = true
 
 		c.drainWG.Add(1)
-		go c.drainApply(i)
+		go c.trackApply(i)
 	}
 	for i := range n {
 		if err := c.mesh.Register(i, c.nodes[i]); err != nil {
@@ -81,8 +98,6 @@ func New(t *testing.T, n int) *Cluster {
 
 // Shutdown kills every node, stops the drain goroutines, and prints a
 // single-line summary of cluster-level stats for post-test visibility.
-// The line is emitted via fmt.Println so it appears under the test name
-// without the "file:line" prefix that t.Logf adds.
 func (c *Cluster) Shutdown() {
 	elapsed := time.Since(c.startedAt)
 	close(c.done)
@@ -106,7 +121,7 @@ func (c *Cluster) Shutdown() {
 		s.Calls,
 		formatByMethod(s.ByMethod),
 		s.Dropped,
-		0,
+		c.opsCount.Load(),
 	)
 }
 
@@ -131,14 +146,21 @@ func formatByMethod(m map[string]int64) string {
 	return sb.String()
 }
 
-// drainApply pulls from a peer's apply channel to keep Raft unblocked.
-// Replication tests will replace this with a tracker that records
-// committed commands.
-func (c *Cluster) drainApply(i int) {
+// trackApply records every committed command each peer applies so tests
+// can later ask "how many peers committed index N, and what value?"
+// Snapshot messages are acknowledged (kept draining) but not yet handled
+// — snapshot-aware tests will extend this.
+func (c *Cluster) trackApply(i int) {
 	defer c.drainWG.Done()
 	for {
 		select {
-		case <-c.applyChs[i]:
+		case msg := <-c.applyChs[i]:
+			if msg.CommandValid {
+				c.appliedMu.Lock()
+				c.appliedCommands[i][msg.CommandIndex] = msg.Command
+				c.appliedMu.Unlock()
+			}
+		// NOTE: ignore SnapshotValid messages for now
 		case <-c.done:
 			return
 		}
@@ -212,6 +234,85 @@ func (c *Cluster) CheckTerms() int {
 		}
 	}
 	return term
+}
+
+// NCommitted reports how many peers have applied the command at the given
+// log index, and what that command's value is
+func (c *Cluster) NCommitted(index int) (int, any) {
+	c.t.Helper()
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+
+	count := 0
+	var committed any
+	sawValue := false
+	for i := range c.n {
+		cmd, ok := c.appliedCommands[i][index]
+		if !ok {
+			continue
+		}
+		if sawValue && !reflect.DeepEqual(cmd, committed) {
+			c.t.Fatalf(
+				"divergent commit at index %d: peer %d has %v, peers earlier have %v",
+				index, i, cmd, committed,
+			)
+		}
+		committed = cmd
+		sawValue = true
+		count++
+	}
+	return count, committed
+}
+
+// One submits cmd to the leader and waits for at least expectedPeers to
+// commit it. If retry is true, it re-tries on a new leader when the
+// current one loses leadership or fails to commit within the inner
+// timeout. Returns the log index where cmd was committed.
+func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
+	c.t.Helper()
+	c.opsCount.Add(1)
+
+	deadline := time.Now().Add(oneOuterTimeout)
+	for time.Now().Before(deadline) {
+		idx := -1
+		for i := range c.n {
+			if !c.isConnected(i) {
+				continue
+			}
+			proposedIdx, _, isLeader := c.nodes[i].Start(cmd)
+			if isLeader {
+				idx = proposedIdx
+				break
+			}
+		}
+		if idx < 0 {
+			// No leader right now; either retry after a short wait or fail.
+			if !retry {
+				c.t.Fatalf("One: no leader available for cmd %v", cmd)
+			}
+			time.Sleep(onePollInterval)
+			continue
+		}
+
+		// Wait for expectedPeers to apply cmd at idx. If a different leader
+		// wins and overwrites idx with something else, break out and retry.
+		innerDeadline := time.Now().Add(oneInnerTimeout)
+		for time.Now().Before(innerDeadline) {
+			count, committed := c.NCommitted(idx)
+			if count >= expectedPeers && reflect.DeepEqual(committed, cmd) {
+				return idx
+			}
+			time.Sleep(onePollInterval)
+		}
+		if !retry {
+			c.t.Fatalf(
+				"One: commit of %v never reached %d peers at idx %d",
+				cmd, expectedPeers, idx,
+			)
+		}
+	}
+	c.t.Fatalf("One: deadline exceeded for cmd %v", cmd)
+	return -1
 }
 
 // Disconnect isolates peer i from the rest of the cluster.
