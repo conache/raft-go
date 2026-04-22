@@ -47,11 +47,20 @@ type Cluster struct {
 	done      chan struct{}
 	drainWG   sync.WaitGroup
 
+	// All apply-time state is guarded by appliedMu. When applyFn is set
+	// via SetApply, every committed command is fed through it and the
+	// returned value stashed in appliedResults, letting linearizability
+	// tests retrieve "what did the state machine return for this op".
 	appliedMu       sync.Mutex
 	appliedCommands []map[int]any
+	appliedResults  []map[int]any
+	applyFn         func(nodeIdx, index int, cmd any) any
 
 	opsCount atomic.Int64
 }
+
+// N returns the cluster size.
+func (c *Cluster) N() int { return c.n }
 
 // New builds and starts an n-node cluster. Caller must defer Shutdown.
 func New(t *testing.T, n int) *Cluster {
@@ -147,7 +156,9 @@ func formatByMethod(m map[string]int64) string {
 }
 
 // trackApply records every committed command each peer applies so tests
-// can later ask "how many peers committed index N, and what value?"
+// can later ask "how many peers committed index N, and what value?". If a
+// state-machine function was registered via SetApply, each committed
+// command is fed through it and the result stored alongside.
 // Snapshot messages are acknowledged (kept draining) but not yet handled
 // — snapshot-aware tests will extend this.
 func (c *Cluster) trackApply(i int) {
@@ -158,6 +169,10 @@ func (c *Cluster) trackApply(i int) {
 			if msg.CommandValid {
 				c.appliedMu.Lock()
 				c.appliedCommands[i][msg.CommandIndex] = msg.Command
+				if c.applyFn != nil {
+					c.appliedResults[i][msg.CommandIndex] =
+						c.applyFn(i, msg.CommandIndex, msg.Command)
+				}
 				c.appliedMu.Unlock()
 			}
 		// NOTE: ignore SnapshotValid messages for now
@@ -165,6 +180,48 @@ func (c *Cluster) trackApply(i int) {
 			return
 		}
 	}
+}
+
+// SetApply registers a state-machine function to run on every committed
+// command. The returned value is stashed per (node, index) and retrievable
+// via Result. Must be called before any commands flow (typically right
+// after New). Safe to call at most once.
+func (c *Cluster) SetApply(fn func(nodeIdx, index int, cmd any) any) {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	c.applyFn = fn
+	c.appliedResults = make([]map[int]any, c.n)
+	for i := range c.n {
+		c.appliedResults[i] = make(map[int]any)
+	}
+}
+
+// Result returns the state-machine output recorded for (nodeIdx, index),
+// or (nil, false) if that node hasn't applied that index yet.
+func (c *Cluster) Result(nodeIdx, index int) (any, bool) {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	if c.appliedResults == nil {
+		return nil, false
+	}
+	r, ok := c.appliedResults[nodeIdx][index]
+	return r, ok
+}
+
+// AnyResult returns the first recorded state-machine output for index
+// across all nodes, or (nil, false) if no node has applied it yet.
+func (c *Cluster) AnyResult(index int) (any, bool) {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	if c.appliedResults == nil {
+		return nil, false
+	}
+	for i := range c.n {
+		if r, ok := c.appliedResults[i][index]; ok {
+			return r, true
+		}
+	}
+	return nil, false
 }
 
 // CheckOneLeader confirms exactly one connected peer believes it is the
