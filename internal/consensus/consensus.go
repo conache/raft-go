@@ -42,14 +42,15 @@ type ApplyMsg struct {
 	Command      any
 	CommandIndex int
 
+	// SnapshotValid is set to true when
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
 }
 
-// Raft implements a single peer in the Raft consensus cluster.
-type Raft struct {
+// Node implements a single peer in the Raft consensus cluster.
+type Node struct {
 	mu    sync.Mutex       // lock to protect shared access to this peer's state
 	peers []transport.Peer // RPC end points of all peers
 	store storage.Store    // persistent state store for this peer
@@ -97,31 +98,31 @@ type Raft struct {
 
 // GetState returns currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (n *Node) GetState() (int, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	return rf.currentTerm, rf.currentRole == rLeader
+	return n.currentTerm, n.currentRole == rLeader
 }
 
 // persist saves durable state (term, vote, log, snapshot metadata) to stable storage.
 // Must be called before acking any RPC that depends on the
 // state being persistent, per Raft's safety guarantees.
 // See Figure 2 of the Raft paper for the full list of required persistent state.
-func (rf *Raft) persist() {
+func (n *Node) persist() {
 	blob := new(bytes.Buffer)
 	e := gob.NewEncoder(blob)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.snapshotLastIncludedIndex)
-	e.Encode(rf.snapshotLastIncludedTerm)
-	e.Encode(rf.log)
-	_ = rf.store.Save(blob.Bytes(), rf.snapshot)
+	e.Encode(n.currentTerm)
+	e.Encode(n.votedFor)
+	e.Encode(n.snapshotLastIncludedIndex)
+	e.Encode(n.snapshotLastIncludedTerm)
+	e.Encode(n.log)
+	_ = n.store.Save(blob.Bytes(), n.snapshot)
 }
 
-// readPersist restores previously persisted state into rf.
-func (rf *Raft) readPersist(data []byte) error {
-	if rf.killed() {
+// readPersist restores previously persisted state into n.
+func (n *Node) readPersist(data []byte) error {
+	if n.killed() {
 		return nil
 	}
 
@@ -154,129 +155,129 @@ func (rf *Raft) readPersist(data []byte) error {
 		return err
 	}
 
-	rf.currentTerm = currentTerm
-	rf.votedFor = votedFor
-	rf.snapshotLastIncludedIndex = snapshotLastIncludedIndex
-	rf.snapshotLastIncludedTerm = snapshotLastIncludedTerm
-	rf.log = logEntries
-	snap, err := rf.store.ReadSnapshot()
+	n.currentTerm = currentTerm
+	n.votedFor = votedFor
+	n.snapshotLastIncludedIndex = snapshotLastIncludedIndex
+	n.snapshotLastIncludedTerm = snapshotLastIncludedTerm
+	n.log = logEntries
+	snap, err := n.store.ReadSnapshot()
 	if err != nil {
 		return err
 	}
-	rf.snapshot = snap
+	n.snapshot = snap
 	return nil
 }
 
 // PersistBytes returns how many bytes are in Raft's persisted log.
-func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.store.StateSize()
+func (n *Node) PersistBytes() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.store.StateSize()
 }
 
 // Snapshot is called by the state machine once it has captured its state
 // up to the specified index. Raft then trims its log through that index.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (n *Node) Snapshot(index int, snapshot []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	// determine node log's (local) index from the global index
 
-	if index <= rf.snapshotLastIncludedIndex {
+	if index <= n.snapshotLastIncludedIndex {
 		dlog.Dlog(
 			dlog.DSnap,
 			"S%d; T%d; R(%s) - Received command to snapshot until idx %d, but already snapshotted until %d",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			index,
-			rf.snapshotLastIncludedIndex,
+			n.snapshotLastIncludedIndex,
 		)
 		return
 	}
 
-	localLogIndex := index - rf.snapshotLastIncludedIndex
+	localLogIndex := index - n.snapshotLastIncludedIndex
 
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - SNAPSHOT. Snapshot node's state until index '%d'(local); '%d'(global)",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		localLogIndex,
 		index,
 	)
 
-	rf.snapshotLastIncludedTerm = rf.log[localLogIndex].Term
-	rf.snapshotLastIncludedIndex = index
-	rf.snapshot = snapshot
-	rf.log = rf.log[localLogIndex:]
-	rf.log[0] = transport.LogEntry{Term: rf.snapshotLastIncludedTerm}
+	n.snapshotLastIncludedTerm = n.log[localLogIndex].Term
+	n.snapshotLastIncludedIndex = index
+	n.snapshot = snapshot
+	n.log = n.log[localLogIndex:]
+	n.log[0] = transport.LogEntry{Term: n.snapshotLastIncludedTerm}
 
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - SNAPSHOT. Snapshot done - new log array: %v",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
-		rf.log,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
+		n.log,
 	)
 
-	rf.persist()
+	n.persist()
 }
 
 // RequestVote handles vote requests from candidates during elections.
-func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (n *Node) RequestVote(args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	if rf.killed() {
+	if n.killed() {
 		*reply = transport.RequestVoteReply{
 			Success: false,
-			Term:    rf.currentTerm,
+			Term:    n.currentTerm,
 		}
 		return
 	}
 
-	if args.Term < rf.currentTerm {
+	if args.Term < n.currentTerm {
 		// the election is for a past term,
 		// so the node doesn't grant the vote
 		// and sends its current term to the requesting candidate
 		*reply = transport.RequestVoteReply{
 			Success: false,
-			Term:    rf.currentTerm,
+			Term:    n.currentTerm,
 		}
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > n.currentTerm {
 		// the candidate node competes in a future term,
 		// so our node should be a follower in that term
-		rf.setNodeTerm(args.Term)
+		n.setNodeTerm(args.Term)
 	}
 
-	if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
+	if n.votedFor != -1 && n.votedFor != args.CandidateID {
 		// vote already granted to another candidate
 		*reply = transport.RequestVoteReply{
 			Success: false,
-			Term:    rf.currentTerm,
+			Term:    n.currentTerm,
 		}
 	} else {
 		// With dummy entry at index 0, log is never empty
-		latestLogIndexNorm := len(rf.log) - 1
-		latestLogIndexGlobal := latestLogIndexNorm + rf.snapshotLastIncludedIndex
-		lastLogTerm := rf.log[latestLogIndexNorm].Term
+		latestLogIndexNorm := len(n.log) - 1
+		latestLogIndexGlobal := latestLogIndexNorm + n.snapshotLastIncludedIndex
+		lastLogTerm := n.log[latestLogIndexNorm].Term
 
 		if args.LastLogTerm > lastLogTerm {
 			// the candidate definitely has more up-to-date data
 			// than the receiver, which makes it worth having the vote
 			// from this peer
-			rf.votedFor = args.CandidateID
+			n.votedFor = args.CandidateID
 			// votedFor changed
-			rf.persist()
+			n.persist()
 
 			*reply = transport.RequestVoteReply{
 				Success: true,
-				Term:    rf.currentTerm,
+				Term:    n.currentTerm,
 			}
 			return
 		}
@@ -286,12 +287,12 @@ func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.Re
 			// the candidate's data is at least as up-to-date
 			// as the receiver's data, so we can grant it
 			// the peer's vote
-			rf.votedFor = args.CandidateID
+			n.votedFor = args.CandidateID
 			// votedFor changed
-			rf.persist()
+			n.persist()
 			*reply = transport.RequestVoteReply{
 				Success: true,
-				Term:    rf.currentTerm,
+				Term:    n.currentTerm,
 			}
 			return
 		}
@@ -300,29 +301,29 @@ func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.Re
 		// not fit for receiving a supporting vote
 		*reply = transport.RequestVoteReply{
 			Success: false,
-			Term:    rf.currentTerm,
+			Term:    n.currentTerm,
 		}
 	}
 }
 
 // AppendEntries handles log-replication RPCs from the leader. It doubles as
 // a heartbeat when Entries is empty.
-func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transport.AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (n *Node) AppendEntries(args *transport.AppendEntriesArgs, reply *transport.AppendEntriesReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	dlog.Dlog(
 		dlog.DInfo,
 		"S%d; T%d; R(%s) - AppendEntries called by S%d.",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LeaderID,
 	)
 
-	logNextIndexGlobal := len(rf.log) + rf.snapshotLastIncludedIndex
-	if rf.killed() {
+	logNextIndexGlobal := len(n.log) + n.snapshotLastIncludedIndex
+	if n.killed() {
 		*reply = transport.AppendEntriesReply{
-			Term:                rf.currentTerm,
+			Term:                n.currentTerm,
 			Success:             false,
 			EntryTerm:           -1,
 			EntryTermStartIndex: logNextIndexGlobal,
@@ -330,15 +331,15 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		return
 	}
 
-	rf.lastHeartbeat = time.Now()
+	n.lastHeartbeat = time.Now()
 
-	if rf.currentRole == rLeader && args.Term == rf.currentTerm {
+	if n.currentRole == rLeader && args.Term == n.currentTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) - DROP. The node is a leader in this term and no longer accepts append entries",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 		)
 		return
 	}
@@ -346,23 +347,23 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 	dlog.Dlog(
 		dlog.DInfo,
 		"S%d; T%d; R(%s) - handle AppendEntries call from S%d",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LeaderID,
 	)
-	if args.Term < rf.currentTerm {
+	if args.Term < n.currentTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) - DROP. leader's term (S%d;T%d) is less than this nodes' term",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			args.LeaderID,
 			args.Term,
 		)
 		*reply = transport.AppendEntriesReply{
-			Term:                rf.currentTerm,
+			Term:                n.currentTerm,
 			Success:             false,
 			EntryTerm:           -1,
 			EntryTermStartIndex: logNextIndexGlobal,
@@ -370,46 +371,46 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > n.currentTerm {
 		// caller's term > current term
 		// ensure the node has the up-to-date term
 		// and is in a follower state
-		rf.setNodeTerm(args.Term)
-	} else if rf.currentRole != rFollower {
+		n.setNodeTerm(args.Term)
+	} else if n.currentRole != rFollower {
 		// we don't call setNodeTerm here,
 		// because we don't want to change
 		// the votedFor state variable
-		rf.currentRole = rFollower
+		n.currentRole = rFollower
 	}
 
 	// if the node already compressed its previous log in a snapshot
 	// we need to account for this and normalize the prevLogIndex value internally
-	prevLogIndexNorm := args.PrevLogIndex - rf.snapshotLastIncludedIndex
+	prevLogIndexNorm := args.PrevLogIndex - n.snapshotLastIncludedIndex
 	if prevLogIndexNorm < 0 {
 		// prevLogIndex entry was already included in the latest snapshot
 		*reply = transport.AppendEntriesReply{
-			Term:                rf.currentTerm,
+			Term:                n.currentTerm,
 			Success:             false,
-			EntryTerm:           rf.snapshotLastIncludedTerm,
-			EntryTermStartIndex: rf.snapshotLastIncludedIndex + 1,
+			EntryTerm:           n.snapshotLastIncludedTerm,
+			EntryTermStartIndex: n.snapshotLastIncludedIndex + 1,
 		}
 		return
 	}
 
 	// Check if we have the entry at prevLogIndexNorm
-	if prevLogIndexNorm >= len(rf.log) {
+	if prevLogIndexNorm >= len(n.log) {
 		// We don't have the entry at prevLogIndexNorm
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) - DROP. Log too short, prevLogIndexNorm %d >= len(log) %d",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			prevLogIndexNorm,
-			len(rf.log),
+			len(n.log),
 		)
 		*reply = transport.AppendEntriesReply{
-			Term:                rf.currentTerm,
+			Term:                n.currentTerm,
 			Success:             false,
 			EntryTerm:           -1,
 			EntryTermStartIndex: logNextIndexGlobal,
@@ -417,32 +418,32 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		return
 	}
 
-	if prevLogIndexNorm >= 0 && rf.log[prevLogIndexNorm].Term != args.PrevLogTerm {
+	if prevLogIndexNorm >= 0 && n.log[prevLogIndexNorm].Term != args.PrevLogTerm {
 		// prevLogIndex term doesn't match
 		// the follower's log entries are outdated
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) - DROP. Conflicting prev log index entries at idx %d: '%d'(existing) <> '%d'(received)",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			prevLogIndexNorm,
-			rf.log[prevLogIndexNorm].Term,
+			n.log[prevLogIndexNorm].Term,
 			args.PrevLogTerm,
 		)
 		// find the index of the first entry in the term
 		termFirstIdx := 0
 		for i := prevLogIndexNorm; i > 0; i-- {
-			if rf.log[i].Term == rf.log[prevLogIndexNorm].Term {
+			if n.log[i].Term == n.log[prevLogIndexNorm].Term {
 				termFirstIdx = i
 			}
 		}
 
 		*reply = transport.AppendEntriesReply{
-			Term:                rf.currentTerm,
+			Term:                n.currentTerm,
 			Success:             false,
-			EntryTerm:           rf.log[prevLogIndexNorm].Term,
-			EntryTermStartIndex: termFirstIdx + rf.snapshotLastIncludedIndex,
+			EntryTerm:           n.log[prevLogIndexNorm].Term,
+			EntryTermStartIndex: termFirstIdx + n.snapshotLastIncludedIndex,
 		}
 		return
 	}
@@ -457,10 +458,10 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		//  - more than the existing, case in which the log array expands
 		//  - less than or equal the existing, case in which the log array has the same length
 		newEntriesEndIdx := prevLogIndexNorm + len(args.Entries) + 1
-		entriesMergeEndIdx := min(len(rf.log), newEntriesEndIdx)
+		entriesMergeEndIdx := min(len(n.log), newEntriesEndIdx)
 		offset := prevLogIndexNorm + 1
 		for i := offset; i < entriesMergeEndIdx && entriesConflictIdx == -1; i++ {
-			if rf.log[i].Term != args.Entries[i-offset].Term {
+			if n.log[i].Term != args.Entries[i-offset].Term {
 				entriesConflictIdx = i
 			}
 		}
@@ -468,37 +469,37 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		if entriesConflictIdx > -1 {
 			// conflict detected
 			// slice out the log part starting at the conflict index
-			rf.log = rf.log[:entriesConflictIdx]
+			n.log = n.log[:entriesConflictIdx]
 			// append the remaining slice
 			newLogEntries := args.Entries[(entriesConflictIdx - offset):]
-			rf.log = append(rf.log, newLogEntries...)
+			n.log = append(n.log, newLogEntries...)
 		} else {
 			// conflict not detected
 			// update log accordingly
 			// special case:
-			if newEntriesEndIdx > len(rf.log) {
-				dlog.Dlog(dlog.DInfo, "S%d; T%d; R(%s) - no entries conflict. Adding entries starting with %d idx: %s", rf.me, rf.currentTerm, rf.currentRole, args.PrevLogIndex+1, dlog.ToTruncatedArrayString(args.Entries))
-				dlog.Dlog(dlog.DLog1, "S%d; T%d; R(%s) - New entries idx: %d vs rf.log: %d", rf.me, rf.currentTerm, rf.currentRole, newEntriesEndIdx, len(rf.log))
+			if newEntriesEndIdx > len(n.log) {
+				dlog.Dlog(dlog.DInfo, "S%d; T%d; R(%s) - no entries conflict. Adding entries starting with %d idx: %s", n.me, n.currentTerm, n.currentRole, args.PrevLogIndex+1, dlog.ToTruncatedArrayString(args.Entries))
+				dlog.Dlog(dlog.DLog1, "S%d; T%d; R(%s) - New entries idx: %d vs n.log: %d", n.me, n.currentTerm, n.currentRole, newEntriesEndIdx, len(n.log))
 				// there are new entries to append
 				newLogEntries := args.Entries[(entriesMergeEndIdx - offset):]
-				rf.log = append(rf.log, newLogEntries...)
-				dlog.Dlog(dlog.DLog1, "S%d; T%d; R(%s) - New entries added: %.50v", rf.me, rf.currentTerm, rf.currentRole, dlog.ToTruncatedArrayString(newLogEntries))
+				n.log = append(n.log, newLogEntries...)
+				dlog.Dlog(dlog.DLog1, "S%d; T%d; R(%s) - New entries added: %.50v", n.me, n.currentTerm, n.currentRole, dlog.ToTruncatedArrayString(newLogEntries))
 			}
 		}
 
 		// log changed, persist the change
-		rf.persist()
+		n.persist()
 	}
 
-	if args.LeaderCommit > rf.commitIndex {
+	if args.LeaderCommit > n.commitIndex {
 		dlog.Dlog(
 			dlog.DInfo,
 			"S%d; T%d; R(%s) - Leader commit index (%d) vs follower commit index (%d)",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			args.LeaderCommit,
-			rf.commitIndex,
+			n.commitIndex,
 		)
 		var lastVerifiedIndexGlobal int
 		if len(args.Entries) > 0 {
@@ -512,22 +513,22 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 			// is matching the leader's term and is a commit index candidate
 			lastVerifiedIndexGlobal = args.PrevLogIndex
 		}
-		rf.commitIndex = min(args.LeaderCommit, lastVerifiedIndexGlobal)
+		n.commitIndex = min(args.LeaderCommit, lastVerifiedIndexGlobal)
 		dlog.Dlog(
 			dlog.DLog2,
 			"S%d; T%d; R(%s) - Updated commit index on the follower to '%d'",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
-			rf.commitIndex,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
+			n.commitIndex,
 		)
-		rf.stateUpdateCond.Broadcast()
+		n.stateUpdateCond.Broadcast()
 	}
 
 	*reply = transport.AppendEntriesReply{
-		Term:                rf.currentTerm,
+		Term:                n.currentTerm,
 		Success:             true,
-		EntryTerm:           rf.currentTerm,
+		EntryTerm:           n.currentTerm,
 		EntryTermStartIndex: args.PrevLogIndex,
 	}
 
@@ -535,27 +536,27 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		dlog.Dlog(
 			dlog.DLog1,
 			"S%d; T%d; R(%s) - Success response - current entries: %v",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
-			rf.log,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
+			n.log,
 		)
 	} else {
-		dlog.Dlog(dlog.DHeartbit, "S%d; T%d; R(%s) - Heartbeat success", rf.me, rf.currentTerm, rf.currentRole)
+		dlog.Dlog(dlog.DHeartbit, "S%d; T%d; R(%s) - Heartbeat success", n.me, n.currentTerm, n.currentRole)
 	}
 }
 
 // InstallSnapshot accepts a snapshot pushed by the leader when this follower
 // is too far behind to catch up via normal log replication.
-func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *transport.InstallSnapshotReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (n *Node) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *transport.InstallSnapshotReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - InstallSnapshot from S%d: LastIncludedIndex=%d, LastIncludedTerm=%d, DataLen=%d",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LeaderID,
 		args.LastIncludedIndex,
 		args.LastIncludedTerm,
@@ -564,41 +565,41 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 
 	// default reply, returned when the execution of the handler is ended
 	*reply = transport.InstallSnapshotReply{
-		Term: rf.currentTerm,
+		Term: n.currentTerm,
 	}
 
-	if rf.killed() {
+	if n.killed() {
 		// node already
 		dlog.Dlog(
 			dlog.DSnap,
 			"S%d; T%d; R(%s) - Handling InstallSnapshot call",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 		)
 		return
 	}
 
-	if rf.currentRole == rLeader && args.Term == rf.currentTerm {
+	if n.currentRole == rLeader && args.Term == n.currentTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) InstallSnapshot(): The node is a leader in this term and no longer accepts these requests",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 		)
 		return
 	}
 	// refresh last heartbit since InstallSnapshot() can only be called by the leader
-	rf.lastHeartbeat = time.Now()
+	n.lastHeartbeat = time.Now()
 
-	if args.Term < rf.currentTerm {
+	if args.Term < n.currentTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) InstallSnapshot(): leader's term (S%d;T%d) is less than this nodes' term",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			args.LeaderID,
 			args.Term,
 		)
@@ -607,39 +608,39 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 
 	// if the snapshot doesn't cover the existing commit index, discard it
 	// this is an invalid snapshot from the perspective of the follower
-	if args.LastIncludedIndex < rf.commitIndex {
+	if args.LastIncludedIndex < n.commitIndex {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) InstallSnapshot(): discarding request because LastIncludedIndex > commitIndex",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			args.LeaderID,
 			args.Term,
 		)
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > n.currentTerm {
 		// caller's term > current term
 		// ensure the node has the up-to-date term
 		// and is in a follower state
-		rf.setNodeTerm(args.Term)
-	} else if rf.currentRole != rFollower {
+		n.setNodeTerm(args.Term)
+	} else if n.currentRole != rFollower {
 		// we don't call setNodeTerm here,
 		// because we don't want to change
 		// the votedFor state variable
-		rf.currentRole = rFollower
+		n.currentRole = rFollower
 	}
 
 	// if snapshot already taken, then skip
-	if rf.snapshotLastIncludedIndex == args.LastIncludedIndex && rf.snapshotLastIncludedTerm == args.LastIncludedTerm {
+	if n.snapshotLastIncludedIndex == args.LastIncludedIndex && n.snapshotLastIncludedTerm == args.LastIncludedTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d; T%d; R(%s) - InstallSnapshot(): Snapshot already up to date. Suggested index: %d(global); Suggested term: %d(global)",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			args.LastIncludedIndex,
 			args.LastIncludedTerm,
 		)
@@ -647,27 +648,27 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 		return
 	}
 
-	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
-	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
-	rf.snapshot = args.Data
-	rf.log = []transport.LogEntry{{Term: args.LastIncludedTerm}}
+	n.snapshotLastIncludedIndex = args.LastIncludedIndex
+	n.snapshotLastIncludedTerm = args.LastIncludedTerm
+	n.snapshot = args.Data
+	n.log = []transport.LogEntry{{Term: args.LastIncludedTerm}}
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - InstallSnapshot() - log updated to only include dummy for SnapshotIndex='%d'(global)",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LastIncludedIndex,
 	)
 
 	// persist the node's state updates
-	rf.persist()
+	n.persist()
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - InstallSnapshot() - state updated. SnapshotIndex='%d'(global)",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LastIncludedIndex,
 	)
 
@@ -677,54 +678,54 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 		CommandIndex: 0,
 
 		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
-		SnapshotTerm:  rf.snapshotLastIncludedTerm,
-		SnapshotIndex: rf.snapshotLastIncludedIndex,
+		Snapshot:      n.snapshot,
+		SnapshotTerm:  n.snapshotLastIncludedTerm,
+		SnapshotIndex: n.snapshotLastIncludedIndex,
 	}
 
 	// NOTE: we don't want to hold locks when sending to the channels
 	// because that might cause a deadlock
 
 	// explicitly unlock to send the snapshotUpdateMsg to the channel
-	rf.mu.Unlock()
+	n.mu.Unlock()
 
 	// send snapshot to applyCh
-	rf.applyCh <- snapshotUpdateMsg
+	n.applyCh <- snapshotUpdateMsg
 	dlog.Dlog(
 		dlog.DSnap,
 		"S%d; T%d; R(%s) - InstallSnapshot() - state transmitted for SnapshotIndex='%d'(global)",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		args.LastIncludedIndex,
 	)
 
 	// Update commit index
 	// explicitly acquire lock to check
-	rf.mu.Lock()
-	if rf.snapshotLastIncludedIndex > rf.commitIndex {
+	n.mu.Lock()
+	if n.snapshotLastIncludedIndex > n.commitIndex {
 		dlog.Dlog(
 			dlog.DSnap,
 			"S%d; T%d; R(%s) - InstallSnapshot(): updated commit index on follower: %d(old) > %d(new)",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
-			rf.commitIndex,
-			rf.snapshotLastIncludedIndex,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
+			n.commitIndex,
+			n.snapshotLastIncludedIndex,
 		)
-		rf.commitIndex = rf.snapshotLastIncludedIndex
-		rf.stateUpdateCond.Broadcast()
+		n.commitIndex = n.snapshotLastIncludedIndex
+		n.stateUpdateCond.Broadcast()
 	}
 	// NOTE: the lock is released by the 'defer' used at the top of the function
 }
 
-func (rf *Raft) callWithTimeout(fn func() bool) bool {
+func (n *Node) callWithTimeout(fn func() bool) bool {
 	done := make(chan bool)
 	cancelled := make(chan struct{})
 
 	go func() {
 		var result bool
-		if rf.killed() {
+		if n.killed() {
 			result = false
 		} else {
 			result = fn()
@@ -748,69 +749,69 @@ func (rf *Raft) callWithTimeout(fn func() bool) bool {
 // reply has been populated; false on timeout, dropped call, or unreachable
 // peer. The caller should retry at a higher level if a false return would
 // be meaningful.
-func (rf *Raft) sendRequestVote(server int, args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) bool {
-	return rf.callWithTimeout(
+func (n *Node) sendRequestVote(server int, args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) bool {
+	return n.callWithTimeout(
 		func() bool {
-			return rf.peers[server].Call(context.Background(), "Raft.RequestVote", args, reply) == nil
+			return n.peers[server].Call(context.Background(), "Raft.RequestVote", args, reply) == nil
 		},
 	)
 }
 
-func (rf *Raft) sendAppendEntries(
+func (n *Node) sendAppendEntries(
 	server int,
 	args *transport.AppendEntriesArgs,
 	reply *transport.AppendEntriesReply,
 ) bool {
-	return rf.callWithTimeout(
+	return n.callWithTimeout(
 		func() bool {
-			return rf.peers[server].Call(context.Background(), "Raft.AppendEntries", args, reply) == nil
+			return n.peers[server].Call(context.Background(), "Raft.AppendEntries", args, reply) == nil
 		},
 	)
 }
 
-func (rf *Raft) sendInstallSnapshot(
+func (n *Node) sendInstallSnapshot(
 	server int,
 	args *transport.InstallSnapshotArgs,
 	reply *transport.InstallSnapshotReply,
 ) bool {
-	return rf.callWithTimeout(
+	return n.callWithTimeout(
 		func() bool {
-			return rf.peers[server].Call(context.Background(), "Raft.InstallSnapshot", args, reply) == nil
+			return n.peers[server].Call(context.Background(), "Raft.InstallSnapshot", args, reply) == nil
 		},
 	)
 }
 
-func (rf *Raft) getNewCommitIndex() int {
+func (n *Node) getNewCommitIndex() int {
 	// calculate new (possible) commit index
-	matchIndexDesc := make([]int, len(rf.matchIndex))
-	copy(matchIndexDesc, rf.matchIndex)
+	matchIndexDesc := make([]int, len(n.matchIndex))
+	copy(matchIndexDesc, n.matchIndex)
 	sort.Slice(matchIndexDesc, func(i, j int) bool {
 		return matchIndexDesc[i] > matchIndexDesc[j]
 	})
 
-	majorityMatchIndex := len(rf.peers) / 2
+	majorityMatchIndex := len(n.peers) / 2
 	// the index at the middle + 1 of matchIndexDesc is present on the majority of the nodes
 	newCommitIndex := matchIndexDesc[majorityMatchIndex]
-	newCommitIndexNorm := newCommitIndex - rf.snapshotLastIncludedIndex
+	newCommitIndexNorm := newCommitIndex - n.snapshotLastIncludedIndex
 
-	if newCommitIndex > 0 && newCommitIndex > rf.commitIndex &&
-		rf.log[newCommitIndexNorm].Term == rf.currentTerm {
+	if newCommitIndex > 0 && newCommitIndex > n.commitIndex &&
+		n.log[newCommitIndexNorm].Term == n.currentTerm {
 		// we can have a new commit index
 		// the entry is replicated on a majority of followers
 		return newCommitIndex
 	}
 
-	return rf.commitIndex
+	return n.commitIndex
 }
 
-func (rf *Raft) applyLogEntriesToState(
+func (n *Node) applyLogEntriesToState(
 	applyCh chan ApplyMsg,
 	offset int,
 	entriesToApply []transport.LogEntry,
 ) {
-	dlog.Dlog(dlog.DTrace, "S%d; - APPLY LOG ENTRIES TO STATE", rf.me)
+	dlog.Dlog(dlog.DTrace, "S%d; - APPLY LOG ENTRIES TO STATE", n.me)
 
-	for i := 0; i < len(entriesToApply) && !rf.killed(); i++ {
+	for i := 0; i < len(entriesToApply) && !n.killed(); i++ {
 		// Assuming this works with no error and is not blocking
 		applyCh <- ApplyMsg{
 			CommandValid: true,
@@ -827,80 +828,80 @@ func (rf *Raft) applyLogEntriesToState(
 
 // update commit index
 // and apply newly committed entries to the node's state
-func (rf *Raft) monitorAndUpdateState() {
-	dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - monitorAndUpdateState", rf.me, rf.currentTerm, rf.currentRole)
+func (n *Node) monitorAndUpdateState() {
+	dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - monitorAndUpdateState", n.me, n.currentTerm, n.currentRole)
 	// take the lock to correctly initialize the latest applied commit index
-	rf.mu.Lock()
-	previousCommitIndex := rf.commitIndex
-	rf.mu.Unlock()
+	n.mu.Lock()
+	previousCommitIndex := n.commitIndex
+	n.mu.Unlock()
 
-	for !rf.killed() {
+	for !n.killed() {
 		// acquire lock to be able to call wait
-		rf.mu.Lock()
-		for rf.commitIndex == previousCommitIndex && !rf.killed() {
+		n.mu.Lock()
+		for n.commitIndex == previousCommitIndex && !n.killed() {
 			// wait for broadcast
 			dlog.Dlog(
 				dlog.DCommit,
 				"S%d; T%d; R(%s) - Listening for the commit index change...Current: %d",
-				rf.me,
-				rf.currentTerm,
-				rf.currentRole,
-				rf.commitIndex,
+				n.me,
+				n.currentTerm,
+				n.currentRole,
+				n.commitIndex,
 			)
-			rf.stateUpdateCond.Wait()
+			n.stateUpdateCond.Wait()
 		}
 
 		dlog.Dlog(
 			dlog.DSuccess,
 			"S%d; T%d; R(%s) - Commit index changed to '%d'!",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
-			rf.commitIndex,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
+			n.commitIndex,
 		)
 
-		newCommitIndex := rf.commitIndex
-		newCommitIndexNorm := max(newCommitIndex-rf.snapshotLastIncludedIndex, 0)
+		newCommitIndex := n.commitIndex
+		newCommitIndexNorm := max(newCommitIndex-n.snapshotLastIncludedIndex, 0)
 		// NOTE: previousCommitIndex can be smaller than snapshotLastIncludedIndex
 		// if the previousCommitIndex's value corresponds to a log index that was included
 		// in the latest snapshot
-		previousCommitIndexNorm := max(previousCommitIndex-rf.snapshotLastIncludedIndex, 0)
+		previousCommitIndexNorm := max(previousCommitIndex-n.snapshotLastIncludedIndex, 0)
 		dlog.Dlog(
 			dlog.DCommit,
 			"S%d; T%d; R(%s) - previousCommitIndexNorm=%d(global:'%d');newCommitIndexNorm=%d(global:'%d')",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			previousCommitIndexNorm,
 			previousCommitIndex,
 			newCommitIndexNorm,
 			newCommitIndex,
 		)
 
-		newEntriesRef := rf.log[previousCommitIndexNorm+1 : newCommitIndexNorm+1]
+		newEntriesRef := n.log[previousCommitIndexNorm+1 : newCommitIndexNorm+1]
 		newEntries := make([]transport.LogEntry, len(newEntriesRef))
 		copy(newEntries, newEntriesRef)
 
-		applyOffset := previousCommitIndexNorm + rf.snapshotLastIncludedIndex + 1
-		nodeKilled := rf.killed()
+		applyOffset := previousCommitIndexNorm + n.snapshotLastIncludedIndex + 1
+		nodeKilled := n.killed()
 
-		rf.mu.Unlock()
+		n.mu.Unlock()
 
 		if !nodeKilled {
-			rf.applyLogEntriesToState(
-				rf.applyCh,
+			n.applyLogEntriesToState(
+				n.applyCh,
 				applyOffset,
 				newEntries,
 			)
 			previousCommitIndex = newCommitIndex
 		} else {
-			dlog.Dlog(dlog.DSuccess, "S%d; T%d; R(%s) - THE NODE WAS KILLED", rf.me, rf.currentTerm, rf.currentRole)
+			dlog.Dlog(dlog.DSuccess, "S%d; T%d; R(%s) - THE NODE WAS KILLED", n.me, n.currentTerm, n.currentRole)
 		}
 
 	}
 }
 
-func (rf *Raft) appendEntriesOnPeer(
+func (n *Node) appendEntriesOnPeer(
 	peerIdx int,
 	nodeTerm int,
 	leaderCommitIdx int,
@@ -909,7 +910,7 @@ func (rf *Raft) appendEntriesOnPeer(
 	snapshotLastIncludedIdx int,
 	isHeartbeat bool,
 ) {
-	if rf.killed() {
+	if n.killed() {
 		return
 	}
 
@@ -918,37 +919,40 @@ func (rf *Raft) appendEntriesOnPeer(
 		logTopic = dlog.DHeartbit
 	}
 
+	// Use nodeTerm + rLeader (captured/known at call entry) in log prefix
+	// instead of live n.currentTerm / n.currentRole, which would race with
+	// concurrent writers in setNodeTerm on other goroutines.
 	dlog.Dlog(
 		logTopic,
 		"S%d; T%d; R(%s) - sendAppendEntries call to S%d",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		nodeTerm,
+		rLeader,
 		peerIdx,
 	)
 
 	var prevLogTerm int
 	operationFinished := false
 
-	for !operationFinished && !rf.killed() {
+	for !operationFinished && !n.killed() {
 		// node not killed, operation not finished,
 		// ensure that the node is still in LEADER role in the INITIAL term before sending the request
 		// Its term and its role can be concurrently changed during a new election
 		// while this goroutine is still in execution
-		rf.mu.Lock()
-		if rf.currentRole != rLeader || rf.currentTerm != nodeTerm {
+		n.mu.Lock()
+		if n.currentRole != rLeader || n.currentTerm != nodeTerm {
 			dlog.Dlog(
 				dlog.DInfo,
 				"S%d; T%d; R(%s) - Node not a leader or initial term finished. Aborting sendAppendEntries call to S%d",
-				rf.me,
-				rf.currentTerm,
-				rf.currentRole,
+				n.me,
+				n.currentTerm,
+				n.currentRole,
 				peerIdx,
 			)
-			rf.mu.Unlock()
+			n.mu.Unlock()
 			return
 		}
-		rf.mu.Unlock()
+		n.mu.Unlock()
 
 		// while the leader figures out which logs slice should be sent to the follower
 		prevLogIndex := nextIndexCopy[peerIdx] - 1
@@ -972,37 +976,37 @@ func (rf *Raft) appendEntriesOnPeer(
 			// prevLogIndex < snapshot
 			// this means that the leader is trying to send entries that are already snapshotted
 			// and no longer stored in the node's log
-			rf.mu.Lock()
+			n.mu.Lock()
 			installSnapshotReq := &transport.InstallSnapshotArgs{
 				Term:              nodeTerm,
-				LeaderID:          rf.me,
-				LastIncludedIndex: rf.snapshotLastIncludedIndex,
-				LastIncludedTerm:  rf.snapshotLastIncludedTerm,
-				Data:              rf.snapshot,
+				LeaderID:          n.me,
+				LastIncludedIndex: n.snapshotLastIncludedIndex,
+				LastIncludedTerm:  n.snapshotLastIncludedTerm,
+				Data:              n.snapshot,
 			}
-			rf.mu.Unlock()
+			n.mu.Unlock()
 
 			dlog.Dlog(dlog.DSnap,
 				"S%d; T%d; R(%s) - requesting 'InstallSnapshot' to S%d; lastIncludedIndex=%d, lastIncludedTerm=%d",
-				rf.me,
+				n.me,
 				nodeTerm,
-				rf.currentRole,
+				rLeader,
 				peerIdx,
 				installSnapshotReq.LastIncludedIndex,
 				installSnapshotReq.LastIncludedTerm,
 			)
 			installSnapshotReply := &transport.InstallSnapshotReply{}
-			success := rf.sendInstallSnapshot(peerIdx, installSnapshotReq, installSnapshotReply)
-			dlog.Dlog(dlog.DSnap, "S%d; T%d; R(%s) - 'InstallSnapshot' to S%d finished", rf.me, nodeTerm, rf.currentRole, peerIdx)
+			success := n.sendInstallSnapshot(peerIdx, installSnapshotReq, installSnapshotReply)
+			dlog.Dlog(dlog.DSnap, "S%d; T%d; R(%s) - 'InstallSnapshot' to S%d finished", n.me, nodeTerm, rLeader, peerIdx)
 
 			if !success {
 				// stop InstallSnapshot request due to network unreliability
 				dlog.Dlog(
 					dlog.DDrop,
 					"S%d; T%d; R(%s) - InstallSnapshot request to S%d failed due to network issue. Operation marked as finished.",
-					rf.me,
+					n.me,
 					installSnapshotReq.Term,
-					rf.currentRole,
+					rLeader,
 					peerIdx,
 				)
 				operationFinished = true
@@ -1010,47 +1014,47 @@ func (rf *Raft) appendEntriesOnPeer(
 				continue
 			}
 
-			rf.mu.Lock()
+			n.mu.Lock()
 			if installSnapshotReply.Term > nodeTerm {
 				// the leader's term is outdated
 				// so we need to set the received term on the node
 				// and convert it back to follower role
-				dlog.Dlog(dlog.DError, "S%d; T%d; R(%s) - InstallSnapshot call: Received higher term from S%d(T%d); converting to follower", rf.me, rf.currentTerm, rf.currentRole, peerIdx, installSnapshotReply.Term)
-				rf.setNodeTerm(installSnapshotReply.Term)
-				rf.mu.Unlock()
+				dlog.Dlog(dlog.DError, "S%d; T%d; R(%s) - InstallSnapshot call: Received higher term from S%d(T%d); converting to follower", n.me, n.currentTerm, n.currentRole, peerIdx, installSnapshotReply.Term)
+				n.setNodeTerm(installSnapshotReply.Term)
+				n.mu.Unlock()
 				continue
 			} else {
 				// update matchIndex and nextIndex
 				// we want to use max() here, because these vaules can be
 				// also updated from other replicateEntries goroutines that
 				// could've come AFTER this current replicateEntries execution
-				rf.nextIndex[peerIdx] = installSnapshotReq.LastIncludedIndex + 1
-				rf.matchIndex[peerIdx] = installSnapshotReq.LastIncludedIndex
+				n.nextIndex[peerIdx] = installSnapshotReq.LastIncludedIndex + 1
+				n.matchIndex[peerIdx] = installSnapshotReq.LastIncludedIndex
 
 				// match index and  index updated
 				// for performance reasons, we can check here if the commit index of the leader changed
-				newCommitIndex := rf.getNewCommitIndex()
-				if rf.commitIndex < newCommitIndex {
+				newCommitIndex := n.getNewCommitIndex()
+				if n.commitIndex < newCommitIndex {
 					// commit index on the leader CAN change => we have a majority of followers that have the entries until the commit index
 					// send an appendEntries request to these nodes, so that the majority update their commit index
 					// This is a performance improvement, because they don't need to wait until the next heartbeat execution
 
 					// can already change the commit index on the leader
 					// since we have a majority on the followers
-					rf.commitIndex = newCommitIndex
-					dlog.Dlog(dlog.DCommit, "S%d; T%d; R(%s) - refreshed commit index to '%d' after installing snapshot", rf.me, rf.currentTerm, rf.currentRole, rf.commitIndex)
-					rf.stateUpdateCond.Broadcast()
+					n.commitIndex = newCommitIndex
+					dlog.Dlog(dlog.DCommit, "S%d; T%d; R(%s) - refreshed commit index to '%d' after installing snapshot", n.me, n.currentTerm, n.currentRole, n.commitIndex)
+					n.stateUpdateCond.Broadcast()
 
 					// propagate commit index change
 					// to the followers
-					go rf.sendHeartbeat()
+					go n.sendHeartbeat()
 				}
 
 				if len(logCopy) == 1 {
 					// the node has only the dummy snapshot entry in the log, so we don't need to send
 					// any remaining log entries
 					operationFinished = true
-					rf.mu.Unlock()
+					n.mu.Unlock()
 					continue
 				}
 
@@ -1058,18 +1062,18 @@ func (rf *Raft) appendEntriesOnPeer(
 				nextIndexCopy[peerIdx] = 1
 				prevLogTerm = installSnapshotReq.LastIncludedTerm
 				prevLogIndex = installSnapshotReq.LastIncludedIndex
-				prevLogIndexNorm = rf.nextIndex[peerIdx] - installSnapshotReq.LastIncludedIndex - 1
+				prevLogIndexNorm = n.nextIndex[peerIdx] - installSnapshotReq.LastIncludedIndex - 1
 				dlog.Dlog(
 					dlog.DSnap,
 					"S%d; T%d; R(%s) - InstallSnapshot: sending the remaining log entries to S%d: prevLogIndexNorm - '%d'; prevLogTerm - '%d'",
-					rf.me,
+					n.me,
 					installSnapshotReq.Term,
-					rf.currentRole,
+					n.currentRole,
 					peerIdx,
 					prevLogIndexNorm,
 					prevLogTerm,
 				)
-				rf.mu.Unlock()
+				n.mu.Unlock()
 			}
 		}
 
@@ -1077,7 +1081,7 @@ func (rf *Raft) appendEntriesOnPeer(
 		entriesSlice := logCopy[prevLogIndexNorm+1:]
 		appendReq := &transport.AppendEntriesArgs{
 			Term:         nodeTerm,
-			LeaderID:     rf.me,
+			LeaderID:     n.me,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			LeaderCommit: leaderCommitIdx,
@@ -1088,34 +1092,34 @@ func (rf *Raft) appendEntriesOnPeer(
 		dlog.Dlog(
 			dlog.DInfo,
 			"S%d; T%d; R(%s) - requesting 'AppendEntries' to S%d",
-			rf.me,
+			n.me,
 			appendReq.Term,
-			rf.currentRole,
+			rLeader,
 			peerIdx,
 		)
-		reqSuccess := rf.sendAppendEntries(peerIdx, appendReq, reply)
+		reqSuccess := n.sendAppendEntries(peerIdx, appendReq, reply)
 
 		dlog.Dlog(
 			dlog.DInfo,
 			"S%d; T%d; R(%s) - finished 'AppendEntries' request to S%d - success: %v",
-			rf.me,
+			n.me,
 			appendReq.Term,
-			rf.currentRole,
+			rLeader,
 			peerIdx,
 			reqSuccess,
 		)
 
 		// request completed, take lock to the node state
-		rf.mu.Lock()
+		n.mu.Lock()
 		if !reqSuccess {
 			// the append entries request failes due to network issues, after multiple retries
 			// therefore, we're "dropping" this request
 			dlog.Dlog(
 				dlog.DDrop,
 				"S%d; T%d; R(%s) - AppendEntries request to S%d failed. Operation marked as finished.",
-				rf.me,
+				n.me,
 				appendReq.Term,
-				rf.currentRole,
+				n.currentRole,
 				peerIdx,
 			)
 			operationFinished = true
@@ -1130,74 +1134,74 @@ func (rf *Raft) appendEntriesOnPeer(
 				// could've come AFTER this current replicateEntries execution
 				maxReplicatedEntryIndex := prevLogIndex + len(entriesSlice)
 				peerNextIndex := maxReplicatedEntryIndex + 1
-				rf.nextIndex[peerIdx] = max(peerNextIndex, rf.nextIndex[peerIdx])
-				rf.matchIndex[peerIdx] = maxReplicatedEntryIndex
+				n.nextIndex[peerIdx] = max(peerNextIndex, n.nextIndex[peerIdx])
+				n.matchIndex[peerIdx] = maxReplicatedEntryIndex
 
 				// match index and  index updated
 				// for performance reasons, we can check here if the commit index of the leader changed
-				newCommitIndex := rf.getNewCommitIndex()
-				if rf.commitIndex < newCommitIndex {
+				newCommitIndex := n.getNewCommitIndex()
+				if n.commitIndex < newCommitIndex {
 					// commit index on the leader CAN change => we have a majority of followers that have the entries until the commit index
 					// send an appendEntries request to these nodes, so that the majority update their commit index
 					// This is a performance improvement, because they don't need to wait until the next heartbeat execution
 
 					// can already change the commit index on the leader
 					// since we have a majority on the followers
-					rf.commitIndex = newCommitIndex
-					dlog.Dlog(dlog.DCommit, "S%d; T%d; R(%s) - refreshed commit index to '%d'", rf.me, rf.currentTerm, rf.currentRole, rf.commitIndex)
-					rf.stateUpdateCond.Broadcast()
+					n.commitIndex = newCommitIndex
+					dlog.Dlog(dlog.DCommit, "S%d; T%d; R(%s) - refreshed commit index to '%d'", n.me, n.currentTerm, n.currentRole, n.commitIndex)
+					n.stateUpdateCond.Broadcast()
 
 					// propagate commit index change
 					// to the followers
-					go rf.sendHeartbeat()
+					go n.sendHeartbeat()
 				}
 
-				dlog.Dlog(logTopic, "S%d; T%d; R(%s) - Slice appended to S%d", rf.me, appendReq.Term, rf.currentRole, peerIdx)
+				dlog.Dlog(logTopic, "S%d; T%d; R(%s) - Slice appended to S%d", n.me, appendReq.Term, n.currentRole, peerIdx)
 				operationFinished = true
-			} else if reply.Term > rf.currentTerm {
+			} else if reply.Term > n.currentTerm {
 				// the leader's term is outdated
 				// so we need to set the received term on the node
 				// and convert it back to follower role
-				dlog.Dlog(dlog.DError, "S%d; T%d; R(%s) - Received higher term from S%d(T%d); converting to follower", rf.me, rf.currentTerm, rf.currentRole, peerIdx, reply.Term)
-				rf.setNodeTerm(reply.Term)
+				dlog.Dlog(dlog.DError, "S%d; T%d; R(%s) - Received higher term from S%d(T%d); converting to follower", n.me, n.currentTerm, n.currentRole, peerIdx, reply.Term)
+				n.setNodeTerm(reply.Term)
 				operationFinished = true
 			} else {
 				// the follower's node doesn't contain an entry at prevLogIndex
 				// whose term matches prevLogTerm
 
-				nextIndexCopy[peerIdx] = min(reply.EntryTermStartIndex, len(logCopy)+rf.snapshotLastIncludedIndex)
-				dlog.Dlog(logTopic, "S%d; T%d; R(%s) - Slice not appended to S%d. Changed nextIndexCopy of peer to %d", rf.me, appendReq.Term, rf.currentRole, peerIdx, nextIndexCopy[peerIdx])
+				nextIndexCopy[peerIdx] = min(reply.EntryTermStartIndex, len(logCopy)+n.snapshotLastIncludedIndex)
+				dlog.Dlog(logTopic, "S%d; T%d; R(%s) - Slice not appended to S%d. Changed nextIndexCopy of peer to %d", n.me, appendReq.Term, n.currentRole, peerIdx, nextIndexCopy[peerIdx])
 			}
 		}
-		rf.mu.Unlock()
+		n.mu.Unlock()
 	}
 }
 
-func (rf *Raft) replicateEntries() {
-	rf.mu.Lock()
+func (n *Node) replicateEntries() {
+	n.mu.Lock()
 	// copy the critical values that the goroutines need
 	// because these values can be modified concurrently by other replicateEntries goroutines
 
 	// copy nextIndex
-	nextIndexCopy := make([]int, len(rf.nextIndex))
-	copy(nextIndexCopy, rf.nextIndex)
+	nextIndexCopy := make([]int, len(n.nextIndex))
+	copy(nextIndexCopy, n.nextIndex)
 	// copy leader's log
-	logCopy := make([]transport.LogEntry, len(rf.log))
-	copy(logCopy, rf.log)
+	logCopy := make([]transport.LogEntry, len(n.log))
+	copy(logCopy, n.log)
 
 	// copy current values (for accurate log)
-	leaderCommitIdx := rf.commitIndex
-	nodeTerm := rf.currentTerm
-	snapshotLatestIncludedIdx := rf.snapshotLastIncludedIndex
-	rf.mu.Unlock()
+	leaderCommitIdx := n.commitIndex
+	nodeTerm := n.currentTerm
+	snapshotLatestIncludedIdx := n.snapshotLastIncludedIndex
+	n.mu.Unlock()
 
-	for peerIdx := range rf.peers {
-		if rf.me == peerIdx {
+	for peerIdx := range n.peers {
+		if n.me == peerIdx {
 			// already applied entry on the leader
 			continue
 		}
 
-		go rf.appendEntriesOnPeer(
+		go n.appendEntriesOnPeer(
 			peerIdx,
 			nodeTerm,
 			leaderCommitIdx,
@@ -1218,116 +1222,121 @@ func (rf *Raft) replicateEntries() {
 //
 // Returns (index, term, isLeader): the index the command will occupy if it
 // commits, the current term, and this peer's view of its own leadership.
-func (rf *Raft) Start(command any) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	nextGlobalLogIdx := len(rf.log) + rf.snapshotLastIncludedIndex
-	term := rf.currentTerm
-	isLeader := rf.currentRole == rLeader
+func (n *Node) Start(command any) (int, int, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	nextGlobalLogIdx := len(n.log) + n.snapshotLastIncludedIndex
+	term := n.currentTerm
+	isLeader := n.currentRole == rLeader
 
-	if !isLeader || rf.killed() {
+	if !isLeader || n.killed() {
 		return nextGlobalLogIdx, term, isLeader
 	}
 	dlog.Dlog(
 		dlog.DClient,
 		"S%d; T%d; R(%s) - leader received new entry: %v. Appending to existing log: %v",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		command,
-		rf.log,
+		n.log,
 	)
 	// append new command to the leader's log
-	rf.log = append(rf.log, transport.LogEntry{Term: term, Command: command})
+	n.log = append(n.log, transport.LogEntry{Term: term, Command: command})
 	// log changed, persist
-	rf.persist()
+	n.persist()
 	// update followers' state arrays
-	rf.matchIndex[rf.me] = nextGlobalLogIdx
-	rf.nextIndex[rf.me] = nextGlobalLogIdx + 1
+	n.matchIndex[n.me] = nextGlobalLogIdx
+	n.nextIndex[n.me] = nextGlobalLogIdx + 1
 
 	dlog.Dlog(
 		dlog.DClient,
 		"S%d; T%d; R(%s) - Entry appended (%v). Replicating on followers",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 		dlog.ToTruncatedArrayItem(command),
 	)
-	go rf.replicateEntries()
+	go n.replicateEntries()
 
 	return nextGlobalLogIdx, term, isLeader
 }
 
-// Kill halts the Raft instance. Long-running goroutines use killed() to
+// Kill halts the node. Long-running goroutines use killed() to
 // check whether they should stop. Use of atomic avoids the need for a lock.
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
+func (n *Node) Kill() {
+	atomic.StoreInt32(&n.dead, 1)
 	// ensure we check again if we have to kill the state monitoring loop
-	rf.stateUpdateCond.Broadcast()
+	n.stateUpdateCond.Broadcast()
 }
 
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
+func (n *Node) killed() bool {
+	z := atomic.LoadInt32(&n.dead)
 	return z == 1
 }
 
 // set term for the node
 // when this method is called, the node automatically becomes a follower
-func (rf *Raft) setNodeTerm(term int) {
-	if rf.currentTerm > term {
+func (n *Node) setNodeTerm(term int) {
+	if n.currentTerm > term {
 		// current term can't be of a higher value
 		// than the newly set term
 		// ignoring request
 		return
 	}
 
-	if rf.killed() {
+	if n.killed() {
 		// panic("Can't set term on a killed node")
 		// Can't set term on a killed node
 		return
 	}
 
-	rf.currentRole = rFollower
-	rf.currentTerm = term
-	rf.votedFor = -1
+	n.currentRole = rFollower
+	n.currentTerm = term
+	n.votedFor = -1
 	// Persist change
-	rf.persist()
+	n.persist()
 }
 
 // increments term
 // the node becomes a candidate
 // votes on self
-func (rf *Raft) markSelfAsCandidate() {
-	rf.currentRole = rCandidate
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
+func (n *Node) markSelfAsCandidate() {
+	n.currentRole = rCandidate
+	n.currentTerm += 1
+	n.votedFor = n.me
 	// persist state change
-	rf.persist()
+	n.persist()
 }
 
-func (rf *Raft) electLeader() {
+func (n *Node) electLeader() {
+	if n.killed() {
+		// node killed
+		return
+	}
+
 	// staring election for new cluster Leader
-	rf.mu.Lock()
-	rf.markSelfAsCandidate()
+	n.mu.Lock()
+	n.markSelfAsCandidate()
 	// track the term where the election begun
-	electionTerm := rf.currentTerm
+	electionTerm := n.currentTerm
 	// supporting votes received during current election
 	votesReceived := 1
 	// total of votes requests finished
 	votesRequestsFinished := 0
 	// setup log-related state variables before requesting the votes
-	lastLogIdxNorm := len(rf.log) - 1
-	lastLogIndexGlobal := lastLogIdxNorm + rf.snapshotLastIncludedIndex
-	lastLogTerm := rf.log[lastLogIdxNorm].Term
+	lastLogIdxNorm := len(n.log) - 1
+	lastLogIndexGlobal := lastLogIdxNorm + n.snapshotLastIncludedIndex
+	lastLogTerm := n.log[lastLogIdxNorm].Term
 
-	rf.mu.Unlock()
+	n.mu.Unlock()
 
-	dlog.Dlog(dlog.DInfo, "S%d; T%d - leader election started", rf.me, rf.currentTerm)
+	dlog.Dlog(dlog.DInfo, "S%d; T%d - leader election started", n.me, n.currentTerm)
 
 	// ask for vote from the other candidates
-	c := sync.NewCond(&rf.mu)
-	for peerIdx := range rf.peers {
-		if rf.me == peerIdx {
+	c := sync.NewCond(&n.mu)
+	for peerIdx := range n.peers {
+		if n.me == peerIdx {
 			// already voted for self
 			continue
 		}
@@ -1336,19 +1345,19 @@ func (rf *Raft) electLeader() {
 		// so that this current's election state is affected?
 		// - election term might end (election timeout was hit)? how's this election "invalidated"?
 		// - the node might've received a heartbeat:
-		// 		a. another candidate won the election having term >= node's term, so the candidate
+		// 		- another candidate won the election having term >= node's term, so the candidate
 		// 		should become a follower
 
 		// request votes concurrently
 		go func() {
 			var voteReply transport.RequestVoteReply
 
-			if rf.killed() {
+			if n.killed() {
 				dlog.Dlog(
 					dlog.DDrop,
 					"S%d; T%d - Node killed. Aborting requestVote call",
-					rf.me,
-					rf.currentTerm,
+					n.me,
+					n.currentTerm,
 				)
 				return
 			}
@@ -1357,20 +1366,20 @@ func (rf *Raft) electLeader() {
 			// request vote from the peer
 			voteReq := transport.RequestVoteArgs{
 				Term:         electionTerm,
-				CandidateID:  rf.me,
+				CandidateID:  n.me,
 				LastLogIndex: lastLogIndexGlobal,
 				LastLogTerm:  lastLogTerm,
 			}
 
-			reqSuccess := rf.sendRequestVote(peerIdx, &voteReq, &voteReply)
+			reqSuccess := n.sendRequestVote(peerIdx, &voteReq, &voteReply)
 
-			rf.mu.Lock()
+			n.mu.Lock()
 			votesRequestsFinished += 1
 			if !reqSuccess {
 				// request failed, do nothing
-				dlog.Dlog(dlog.DDrop, "S%d; T%d - Request to S%d failed", rf.me, voteReq.Term, peerIdx)
+				dlog.Dlog(dlog.DDrop, "S%d; T%d - Request to S%d failed", n.me, voteReq.Term, peerIdx)
 			} else {
-				dlog.Dlog(dlog.DInfo, "S%d; T%d - Request to S%d succeeded", rf.me, voteReq.Term, peerIdx)
+				dlog.Dlog(dlog.DInfo, "S%d; T%d - Request to S%d succeeded", n.me, voteReq.Term, peerIdx)
 				if voteReply.Success {
 					// rpc request suceeded
 					// the term might've been changed meanwhile, so we need
@@ -1382,101 +1391,101 @@ func (rf *Raft) electLeader() {
 					// the candidate didn't receive the vote:
 					// (a) the candidate's term might be behind
 					// (b) the peer already voted for another candidate
-					if voteReply.Term > rf.currentTerm {
+					if voteReply.Term > n.currentTerm {
 						// if the current's candidate term is behind
 						// update the node's term and convert the node back to follower role
-						rf.setNodeTerm(voteReply.Term)
+						n.setNodeTerm(voteReply.Term)
 					}
 				}
 			}
 			c.Broadcast()
-			rf.mu.Unlock()
+			n.mu.Unlock()
 		}()
 	}
 
 	// the goroutine code will try to write the same shared data read
 	// in the for condition ('votesReceived' and 'votesRequestsFinished')
 	// to prevent race conditions, we should use a lock
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	expectedVoteRequests := len(rf.peers) - 1
-	quorum := len(rf.peers)/2 + 1
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	expectedVoteRequests := len(n.peers) - 1
+	quorum := len(n.peers)/2 + 1
 	// we keep the same quorum size, regardless if there are network partitions or not
 	for votesReceived < quorum && votesRequestsFinished != expectedVoteRequests {
 		c.Wait()
 	}
 
 	if votesReceived < quorum {
-		dlog.Dlog(dlog.DDrop, "Candidate %v not elected", rf.me)
+		dlog.Dlog(dlog.DDrop, "Candidate %v not elected", n.me)
 		return
 	}
 
-	if rf.currentRole != rCandidate || rf.currentTerm != electionTerm {
+	if n.currentRole != rCandidate || n.currentTerm != electionTerm {
 		dlog.Dlog(
 			dlog.DDrop,
 			"S%d - Node no longer candidate (role - %s) OR current term changed (term - %d)",
-			rf.me,
-			rf.currentRole,
-			rf.currentTerm,
+			n.me,
+			n.currentRole,
+			n.currentTerm,
 		)
 		return
 	}
 
-	dlog.Dlog(dlog.DVote, "S%d; T%d - elected as leader", rf.me, rf.currentTerm)
-	rf.currentRole = rLeader
+	dlog.Dlog(dlog.DVote, "S%d; T%d - elected as leader", n.me, n.currentTerm)
+	n.currentRole = rLeader
 	dlog.Dlog(
 		dlog.DLeader,
 		"S%d; T%d; R(%s) - init leader-specific state",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 	)
-	rf.initFollowersArrays()
+	n.initFollowersArrays()
 	dlog.Dlog(
 		dlog.DLeader,
 		"S%d; T%d; R(%s) - sending first heartbeats as leader",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 	)
-	go rf.sendHeartbeat()
+	go n.sendHeartbeat()
 }
 
-func (rf *Raft) initFollowersArrays() {
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
+func (n *Node) initFollowersArrays() {
+	n.nextIndex = make([]int, len(n.peers))
+	n.matchIndex = make([]int, len(n.peers))
 
-	for peerIdx := range rf.peers {
+	for peerIdx := range n.peers {
 		// note: we initialize the entries at the current node's index as well
 		// but we're not gonna actually use it in the implementation,
 		// because we have the actual node's state that we can use
 
 		// initially: [1, 1, 1, ... ] (pointing past the dummy entry)
-		rf.nextIndex[peerIdx] = len(rf.log) + rf.snapshotLastIncludedIndex
+		n.nextIndex[peerIdx] = len(n.log) + n.snapshotLastIncludedIndex
 		// initially: [0, 0, 0, ...] (dummy entry is "replicated" everywhere)
-		rf.matchIndex[peerIdx] = 0
+		n.matchIndex[peerIdx] = 0
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (n *Node) sendHeartbeat() {
 	// send heartbeat to the peers in the cluster
 	// note that here the append entries method
 	// also sends any missing entries to the follower
 	// having a double role: both sending a heartbeat,
 	// but also replicating the entries missing on the follower node
 
-	rf.mu.Lock()
+	n.mu.Lock()
 
-	if rf.currentRole != rLeader {
+	if n.currentRole != rLeader {
 		dlog.Dlog(
 			dlog.DHeartbit,
 			"S%d; T%d; R(%s) - sendHeartbeat - NODE NOT A LEADER ANYMORE, DROPPING REQUEST",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 		)
 		// release the lock
-		rf.mu.Unlock()
+		n.mu.Unlock()
 		// finish the execution
 		return
 	}
@@ -1485,40 +1494,40 @@ func (rf *Raft) sendHeartbeat() {
 	dlog.Dlog(
 		dlog.DHeartbit,
 		"S%d; T%d; R(%s) - sendHeartbeat - LOCK ACQUIRED",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 	)
 	// copy the critical values that the goroutines need
 	// because these values can be modified concurrently by other replicateEntries goroutines
 
 	// copy nextIndex
-	nextIndexCopy := make([]int, len(rf.nextIndex))
-	copy(nextIndexCopy, rf.nextIndex)
+	nextIndexCopy := make([]int, len(n.nextIndex))
+	copy(nextIndexCopy, n.nextIndex)
 	// copy leader's log
-	logCopy := make([]transport.LogEntry, len(rf.log))
-	copy(logCopy, rf.log)
+	logCopy := make([]transport.LogEntry, len(n.log))
+	copy(logCopy, n.log)
 
-	leaderCommitIdx := rf.commitIndex
-	nodeTerm := rf.currentTerm
-	snapshotLatestIncludedIdx := rf.snapshotLastIncludedIndex
+	leaderCommitIdx := n.commitIndex
+	nodeTerm := n.currentTerm
+	snapshotLatestIncludedIdx := n.snapshotLastIncludedIndex
 
 	// adding here for race conditions protection
 	dlog.Dlog(
 		dlog.DHeartbit,
 		"S%d; T%d; R(%s) - sendHeartbeat - LOCK RELEASED",
-		rf.me,
-		rf.currentTerm,
-		rf.currentRole,
+		n.me,
+		n.currentTerm,
+		n.currentRole,
 	)
-	rf.mu.Unlock()
+	n.mu.Unlock()
 
-	for peerIdx := range rf.peers {
-		if rf.me == peerIdx {
+	for peerIdx := range n.peers {
+		if n.me == peerIdx {
 			continue
 		}
 
-		go rf.appendEntriesOnPeer(
+		go n.appendEntriesOnPeer(
 			peerIdx,
 			nodeTerm,
 			leaderCommitIdx,
@@ -1530,18 +1539,18 @@ func (rf *Raft) sendHeartbeat() {
 	}
 }
 
-func (rf *Raft) ticker() {
+func (n *Node) ticker() {
 	// stop loop when server gets killed
-	for !rf.killed() {
-		rf.mu.Lock()
-		isLeader := rf.currentRole == rLeader
-		rf.mu.Unlock()
+	for !n.killed() {
+		n.mu.Lock()
+		isLeader := n.currentRole == rLeader
+		n.mu.Unlock()
 
 		if isLeader {
 			// send heartbeat to the peers
 			// wait until sending the next heartbeat
 			time.Sleep(heartbeatInterval)
-			go rf.sendHeartbeat()
+			go n.sendHeartbeat()
 			continue
 		}
 
@@ -1557,95 +1566,94 @@ func (rf *Raft) ticker() {
 		time.Sleep(electionTimeout)
 
 		// check latest node state
-		rf.mu.Lock()
-		timeSinceLastHeartbeat := time.Since(rf.lastHeartbeat)
-		isLeader = rf.currentRole == rLeader
+		n.mu.Lock()
+		timeSinceLastHeartbeat := time.Since(n.lastHeartbeat)
+		isLeader = n.currentRole == rLeader
 
 		dlog.Dlog(
 			dlog.DInfo,
 			"S%d; T%d; R(%s) - time since last hearbeat: %d ms",
-			rf.me,
-			rf.currentTerm,
-			rf.currentRole,
+			n.me,
+			n.currentTerm,
+			n.currentRole,
 			timeSinceLastHeartbeat.Milliseconds(),
 		)
-		rf.mu.Unlock()
+		n.mu.Unlock()
 
 		if isLeader {
 			dlog.Dlog(
 				dlog.DLeader,
 				"S%d; T%d; R(%s) - Node became leader meanwhile",
-				rf.me,
-				rf.currentTerm,
-				rf.currentRole,
+				n.me,
+				n.currentTerm,
+				n.currentRole,
 			)
 			// the node became a leader during the election timeout
 			// so no need to start an election
 		} else if timeSinceLastHeartbeat > electionTimeout {
-			dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - tshb(%d ms) > electionTimeout (%d ms)", rf.me, rf.currentTerm, rf.currentRole, timeSinceLastHeartbeat.Milliseconds(), electionTimeout.Milliseconds())
+			dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - tshb(%d ms) > electionTimeout (%d ms)", n.me, n.currentTerm, n.currentRole, timeSinceLastHeartbeat.Milliseconds(), electionTimeout.Milliseconds())
 			// 1. Follower node: if the election time passed without a heartbeat
 			// then we need to start a new election
 
 			// 2. Candidate node: the election time passed without
 			// - the node becoming a leader (already checked above)
 			// - the node receiving a heartbeat (a new leader was chosen)
-			dlog.Dlog(dlog.DInfo, "S%d; T%d; R(%s) - election timeout crossed, starting a leader election", rf.me, rf.currentTerm, rf.currentRole)
-			if !rf.killed() {
-				go rf.electLeader()
-			}
+			dlog.Dlog(dlog.DInfo, "S%d; T%d; R(%s) - election timeout crossed, starting a leader election", n.me, n.currentTerm, n.currentRole)
+			go n.electLeader()
 		}
 	}
-	dlog.Dlog(dlog.DDrop, "S%d; T%d; R(%s) - Node killed", rf.me, rf.currentTerm, rf.currentRole)
+	dlog.Dlog(dlog.DDrop, "S%d; T%d; R(%s) - Node killed", n.me, n.currentTerm, n.currentRole)
 }
 
-// Make creates a Raft server. The ports of all the Raft servers (including
-// this one) are in peers[]. This server's index in that slice is me. store
-// persists this server's durable state across restarts; applyCh is the
-// channel on which the caller expects Raft to send ApplyMsg messages.
+// Make creates a Raft node. The full set of peers in the cluster is given
+// in peers[] and this node's own index in that slice is me. store persists
+// the node's durable state across restarts; applyCh is the channel on which
+// the caller expects the node to send ApplyMsg messages.
 // Make() returns quickly; long-running work is started as goroutines.
 func Make(peers []transport.Peer, me int,
 	store storage.Store, applyCh chan ApplyMsg,
-) (*Raft, error) {
+) (*Node, error) {
 	// Callers are responsible for calling Kill() when done so that the
-	// long-running goroutines spawned below shut down cleanly; guard
-	// goroutines with killed() to exit on cancellation.
+	// long-running goroutines spawned below shut down cleanly;
+	// Each goroutine is guarded with killed() to make sure they shut down correctly
 
-	rf := &Raft{}
-	rf.peers = peers
-	rf.store = store
-	rf.me = me
-	rf.applyCh = applyCh
+	n := &Node{}
+	n.peers = peers
+	n.store = store
+	n.me = me
+	n.applyCh = applyCh
 
-	dlog.Dlog(dlog.DTrace, "S%d; - SERVER JUST STARTED", rf.me)
+	dlog.Dlog(dlog.DTrace, "S%d; - NODE STARTED", n.me)
+
 	// Initialization
-	rf.stateUpdateCond = sync.NewCond(&rf.mu)
-	rf.currentRole = rFollower
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	// add dummy entry, to have the implementation 1-based
-	rf.log = []transport.LogEntry{{Term: 0}}
+	n.stateUpdateCond = sync.NewCond(&n.mu)
+	n.currentRole = rFollower
+	n.currentTerm = 0
+	n.votedFor = -1
 
-	rf.commitIndex = 0
-	rf.lastHeartbeat = time.Now()
+	// add dummy entry, to make sure that the implementation 1-based
+	n.log = []transport.LogEntry{{Term: 0}}
+	n.commitIndex = 0
+	n.lastHeartbeat = time.Now()
 
-	// initialize from state persisted before a crash
-	// force init here, but not sure it's the best approach
-	// we might want to include the next and match indexes in the persisted state
-	rf.initFollowersArrays()
+	// initialize from state persisted before (a potential) crash
+	// TODO: remove this initialization
+	// n.initFollowersArrays()
+
 	state, err := store.ReadState()
 	if err != nil {
 		return nil, fmt.Errorf("consensus: reading persisted state: %w", err)
 	}
-	if err := rf.readPersist(state); err != nil {
+	if err := n.readPersist(state); err != nil {
 		return nil, fmt.Errorf("consensus: decoding persisted state: %w", err)
 	}
-	dlog.Dlog(dlog.DTrace, "S%d; - SERVER JUST STARTED. Node role is '%d'", rf.me, rf.currentRole)
+	dlog.Dlog(dlog.DTrace, "S%d; - SERVER JUST STARTED. Node role is '%d'", n.me, n.currentRole)
 
 	// start monitor and state update goroutine
-	go rf.monitorAndUpdateState()
+	go n.monitorAndUpdateState()
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go n.ticker()
 
-	return rf, nil
+	return n, nil
 }
