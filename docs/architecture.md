@@ -145,7 +145,9 @@ Glue + a runnable CLI binary that wires consensus + a transport + a store
 + a state machine into a real node.
 
 ### `internal/dlog` (private)
-Topic-filtered debug logger. Ported verbatim from the MIT course work.
+Topic-filtered debug logger used during development. Enabled by setting
+`DEBUG_TRACE=1` in the environment. The companion `tools/dslogs.py` parses
+and colorizes its output.
 
 ### `internal/testcluster` (private)
 Multi-node cluster harness used by consensus tests. Wires N consensus

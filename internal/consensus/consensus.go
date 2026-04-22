@@ -1,16 +1,10 @@
 package consensus
 
-// Make() creates a new raft peer.
-
-// NOTE: after doing the initial implementation, I commented out many of the debugging logs
-// for avoiding false-positive race conditions
-
 import (
 	"bytes"
 	"context"
 	"encoding/gob"
 	"fmt"
-	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -22,7 +16,15 @@ import (
 	"github.com/conache/raft-go/transport"
 )
 
-const HEARTBEAT_INTERVAL_MS = 100
+// Timing parameters. rpcTimeout must be less than electionTimeoutMin so
+// that a failed RPC can be retried (or abandoned) before an election
+// timeout fires elsewhere in the cluster.
+const (
+	heartbeatInterval  = 100 * time.Millisecond
+	rpcTimeout         = 150 * time.Millisecond
+	electionTimeoutMin = 250 * time.Millisecond
+	electionTimeoutMax = 500 * time.Millisecond
+)
 
 type nodeRole string
 
@@ -32,10 +34,9 @@ const (
 	rLeader    nodeRole = "LEADER"
 )
 
-// ApplyMsg is delivered on applyCh to the consumer (rsm or a custom
-// applier). CommandValid is set for a newly committed log entry; the
-// Snapshot* fields are set when the leader pushed a snapshot that the
-// follower just installed.
+// ApplyMsg is delivered on applyCh to the consumer (rsm or a custom applier)
+// CommandValid is set for a newly committed log entry;
+// the Snapshot* fields are set when the leader pushed a snapshot that the follower just installed.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      any
@@ -47,11 +48,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-// A Go object implementing a single Raft peer.
+// Raft implements a single peer in the Raft consensus cluster.
 type Raft struct {
-	mu    sync.Mutex       // Lock to protect shared access to this peer's state
+	mu    sync.Mutex       // lock to protect shared access to this peer's state
 	peers []transport.Peer // RPC end points of all peers
-	store storage.Store    // Object to hold this peer's persisted state
+	store storage.Store    // persistent state store for this peer
 	me    int              // this peer's index into peers[]
 	dead  int32            // set by Kill()
 
@@ -61,9 +62,9 @@ type Raft struct {
 
 	// current node role
 	currentRole nodeRole
-	// Current term of the node
+	// current term of the node
 	currentTerm int
-	// candidateId that received vote in the current term (null if none)
+	// peer this node voted for in the current term (-1 if none)
 	votedFor int
 	// the server's log entries
 	log []transport.LogEntry
@@ -77,11 +78,11 @@ type Raft struct {
 	matchIndex []int
 
 	// log entries indices
-	// index of the highest log entry known to be commited
+	// index of the highest log entry known to be committed
 	commitIndex int
 
 	// last heartbeat time
-	lastHeartbit time.Time
+	lastHeartbeat time.Time
 
 	// latest snapshot
 	snapshot []byte
@@ -94,7 +95,7 @@ type Raft struct {
 	applyCh chan ApplyMsg
 }
 
-// return currentTerm and whether this server
+// GetState returns currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
@@ -103,13 +104,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.currentRole == rLeader
 }
 
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to store.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
+// persist saves durable state (term, vote, log, snapshot metadata) to stable storage.
+// Must be called before acking any RPC that depends on the
+// state being persistent, per Raft's safety guarantees.
+// See Figure 2 of the Raft paper for the full list of required persistent state.
 func (rf *Raft) persist() {
 	blob := new(bytes.Buffer)
 	e := gob.NewEncoder(blob)
@@ -121,7 +119,7 @@ func (rf *Raft) persist() {
 	_ = rf.store.Save(blob.Bytes(), rf.snapshot)
 }
 
-// restore previously persisted state.
+// readPersist restores previously persisted state into rf.
 func (rf *Raft) readPersist(data []byte) error {
 	if rf.killed() {
 		return nil
@@ -133,6 +131,7 @@ func (rf *Raft) readPersist(data []byte) error {
 
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
+
 	var currentTerm int
 	var votedFor int
 	var snapshotLastIncludedIndex int
@@ -168,25 +167,27 @@ func (rf *Raft) readPersist(data []byte) error {
 	return nil
 }
 
-// how many bytes in Raft's persisted log?
+// PersistBytes returns how many bytes are in Raft's persisted log.
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.store.StateSize()
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// Snapshot is called by the state machine once it has captured its state
+// up to the specified index. Raft then trims its log through that index.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// determine node log's (local) index from the global index
 
 	if index <= rf.snapshotLastIncludedIndex {
-		log.Printf(
-			"Received commannd to snapshot until idx %d, but already snapshotted until %d",
+		dlog.Dlog(
+			dlog.DSnap,
+			"S%d; T%d; R(%s) - Received command to snapshot until idx %d, but already snapshotted until %d",
+			rf.me,
+			rf.currentTerm,
+			rf.currentRole,
 			index,
 			rf.snapshotLastIncludedIndex,
 		)
@@ -223,7 +224,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 }
 
-// RequestVote RPC handler.
+// RequestVote handles vote requests from candidates during elections.
 func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -266,7 +267,7 @@ func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.Re
 		lastLogTerm := rf.log[latestLogIndexNorm].Term
 
 		if args.LastLogTerm > lastLogTerm {
-			// the candidate deifintely has more up-to-date data
+			// the candidate definitely has more up-to-date data
 			// than the receiver, which makes it worth having the vote
 			// from this peer
 			rf.votedFor = args.CandidateID
@@ -304,6 +305,8 @@ func (rf *Raft) RequestVote(args *transport.RequestVoteArgs, reply *transport.Re
 	}
 }
 
+// AppendEntries handles log-replication RPCs from the leader. It doubles as
+// a heartbeat when Entries is empty.
 func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transport.AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -327,7 +330,7 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		return
 	}
 
-	rf.lastHeartbit = time.Now()
+	rf.lastHeartbeat = time.Now()
 
 	if rf.currentRole == rLeader && args.Term == rf.currentTerm {
 		dlog.Dlog(
@@ -452,7 +455,7 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		entriesConflictIdx := -1
 		// new log array length (after update) is either:
 		//  - more than the existing, case in which the log array expands
-		//  - less than or equal the existing, case in whcih the log array has the same length
+		//  - less than or equal the existing, case in which the log array has the same length
 		newEntriesEndIdx := prevLogIndexNorm + len(args.Entries) + 1
 		entriesMergeEndIdx := min(len(rf.log), newEntriesEndIdx)
 		offset := prevLogIndexNorm + 1
@@ -527,6 +530,7 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 		EntryTerm:           rf.currentTerm,
 		EntryTermStartIndex: args.PrevLogIndex,
 	}
+
 	if len(args.Entries) != 0 {
 		dlog.Dlog(
 			dlog.DLog1,
@@ -541,6 +545,8 @@ func (rf *Raft) AppendEntries(args *transport.AppendEntriesArgs, reply *transpor
 	}
 }
 
+// InstallSnapshot accepts a snapshot pushed by the leader when this follower
+// is too far behind to catch up via normal log replication.
 func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *transport.InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -584,7 +590,7 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 		return
 	}
 	// refresh last heartbit since InstallSnapshot() can only be called by the leader
-	rf.lastHeartbit = time.Now()
+	rf.lastHeartbeat = time.Now()
 
 	if args.Term < rf.currentTerm {
 		dlog.Dlog(
@@ -676,9 +682,10 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 		SnapshotIndex: rf.snapshotLastIncludedIndex,
 	}
 
-	// explicitly unlock to send the snapshotUpdateMsg to the channel
 	// NOTE: we don't want to hold locks when sending to the channels
 	// because that might cause a deadlock
+
+	// explicitly unlock to send the snapshotUpdateMsg to the channel
 	rf.mu.Unlock()
 
 	// send snapshot to applyCh
@@ -713,9 +720,6 @@ func (rf *Raft) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *tran
 
 func (rf *Raft) callWithTimeout(fn func() bool) bool {
 	done := make(chan bool)
-	// note: request timeout has to be less than election timeout
-	// so that we can elect a leader in the given election time
-	requestTimeout := 150 * time.Millisecond
 	cancelled := make(chan struct{})
 
 	go func() {
@@ -734,29 +738,16 @@ func (rf *Raft) callWithTimeout(fn func() bool) bool {
 	select {
 	case result := <-done:
 		return result
-	case <-time.After(requestTimeout):
+	case <-time.After(rpcTimeout):
 		close(cancelled)
 		return false
 	}
 }
 
-// send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, this returns true; otherwise it
-// returns false. A false return can be caused by a dead server, a
-// live server that can't be reached, a lost request, or a lost reply.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
+// sendRequestVote sends a RequestVote RPC to a peer. It returns true once
+// reply has been populated; false on timeout, dropped call, or unreachable
+// peer. The caller should retry at a higher level if a false return would
+// be meaningful.
 func (rf *Raft) sendRequestVote(server int, args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) bool {
 	return rf.callWithTimeout(
 		func() bool {
@@ -835,7 +826,7 @@ func (rf *Raft) applyLogEntriesToState(
 }
 
 // update commit index
-// and apply newly commited entries to the node's state
+// and apply newly committed entries to the node's state
 func (rf *Raft) monitorAndUpdateState() {
 	dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - monitorAndUpdateState", rf.me, rf.currentTerm, rf.currentRole)
 	// take the lock to correctly initialize the latest applied commit index
@@ -844,7 +835,7 @@ func (rf *Raft) monitorAndUpdateState() {
 	rf.mu.Unlock()
 
 	for !rf.killed() {
-		// acqiuire lock to be able to call wait
+		// acquire lock to be able to call wait
 		rf.mu.Lock()
 		for rf.commitIndex == previousCommitIndex && !rf.killed() {
 			// wait for broadcast
@@ -876,7 +867,7 @@ func (rf *Raft) monitorAndUpdateState() {
 		previousCommitIndexNorm := max(previousCommitIndex-rf.snapshotLastIncludedIndex, 0)
 		dlog.Dlog(
 			dlog.DCommit,
-			"S%d; T%d; R(%s) - previousCommitIndexNorm=%d(gobal:'%d');newCommitIndexNorm=%d(global:'%d')",
+			"S%d; T%d; R(%s) - previousCommitIndexNorm=%d(global:'%d');newCommitIndexNorm=%d(global:'%d')",
 			rf.me,
 			rf.currentTerm,
 			rf.currentRole,
@@ -940,15 +931,15 @@ func (rf *Raft) appendEntriesOnPeer(
 	operationFinished := false
 
 	for !operationFinished && !rf.killed() {
-		// node not killed, opperation not finished,
+		// node not killed, operation not finished,
 		// ensure that the node is still in LEADER role in the INITIAL term before sending the request
-		// Its term and its role can be concurrently changed durring a new election
+		// Its term and its role can be concurrently changed during a new election
 		// while this goroutine is still in execution
 		rf.mu.Lock()
 		if rf.currentRole != rLeader || rf.currentTerm != nodeTerm {
 			dlog.Dlog(
 				dlog.DInfo,
-				"S%d; T%d; R(%s) - Node not a leader or initial term finished. Abording sendAppendEntries call to S%d",
+				"S%d; T%d; R(%s) - Node not a leader or initial term finished. Aborting sendAppendEntries call to S%d",
 				rf.me,
 				rf.currentTerm,
 				rf.currentRole,
@@ -959,14 +950,14 @@ func (rf *Raft) appendEntriesOnPeer(
 		}
 		rf.mu.Unlock()
 
-		// while the leader figures out which logs slice should be send to the follower
+		// while the leader figures out which logs slice should be sent to the follower
 		prevLogIndex := nextIndexCopy[peerIdx] - 1
 
 		// normalize prev log index if snapshot/s already happened
 		// we still need to communicate the unnormalized value with the other nodes
 		prevLogIndexNorm := prevLogIndex - snapshotLastIncludedIdx
 		if prevLogIndexNorm >= len(logCopy) {
-			// NOTE: discard the entire append entries opperation
+			// NOTE: discard the entire append entries operation
 			// this is an edge case that happened because the currently-executing goroutine
 			// was scheduled very late in the execution, so late that the node already did multiple snapshots
 			// (case in which norm(prevLogInedx) index is outside of the log array
@@ -980,7 +971,7 @@ func (rf *Raft) appendEntriesOnPeer(
 			// TODO: consider separating in its own function
 			// prevLogIndex < snapshot
 			// this means that the leader is trying to send entries that are already snapshotted
-			// and no longer storred in the node's log
+			// and no longer stored in the node's log
 			rf.mu.Lock()
 			installSnapshotReq := &transport.InstallSnapshotArgs{
 				Term:              nodeTerm,
@@ -1190,10 +1181,6 @@ func (rf *Raft) replicateEntries() {
 	// copy nextIndex
 	nextIndexCopy := make([]int, len(rf.nextIndex))
 	copy(nextIndexCopy, rf.nextIndex)
-	// copy matchIndex
-	matchIndexCopy := make([]int, len(rf.matchIndex))
-	copy(matchIndexCopy, rf.matchIndex)
-	_ = matchIndexCopy
 	// copy leader's log
 	logCopy := make([]transport.LogEntry, len(rf.log))
 	copy(logCopy, rf.log)
@@ -1223,18 +1210,14 @@ func (rf *Raft) replicateEntries() {
 	}
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
+// Start requests that command be appended to the replicated log. If this
+// peer is not the leader, Start returns immediately with isLeader=false. On
+// the leader, it appends to the local log and kicks off replication; there
+// is no guarantee the command will be committed, because the leader may
+// fail or lose its term. Start also returns gracefully after Kill().
 //
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+// Returns (index, term, isLeader): the index the command will occupy if it
+// commits, the current term, and this peer's view of its own leadership.
 func (rf *Raft) Start(command any) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -1328,7 +1311,7 @@ func (rf *Raft) electLeader() {
 	rf.markSelfAsCandidate()
 	// track the term where the election begun
 	electionTerm := rf.currentTerm
-	// supporting votes received durring current election
+	// supporting votes received during current election
 	votesReceived := 1
 	// total of votes requests finished
 	votesRequestsFinished := 0
@@ -1349,7 +1332,7 @@ func (rf *Raft) electLeader() {
 			continue
 		}
 
-		// Q: what could happen concurrently durring the votes gathering,
+		// Q: what could happen concurrently during the votes gathering,
 		// so that this current's election state is affected?
 		// - election term might end (election timeout was hit)? how's this election "invalidated"?
 		// - the node might've received a heartbeat:
@@ -1443,7 +1426,7 @@ func (rf *Raft) electLeader() {
 	rf.currentRole = rLeader
 	dlog.Dlog(
 		dlog.DLeader,
-		"S%d; T%d; R(%s) - init leader-speciffic state",
+		"S%d; T%d; R(%s) - init leader-specific state",
 		rf.me,
 		rf.currentTerm,
 		rf.currentRole,
@@ -1476,7 +1459,7 @@ func (rf *Raft) initFollowersArrays() {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	// send hearteat to the peers in the cluster
+	// send heartbeat to the peers in the cluster
 	// note that here the append entries method
 	// also sends any missing entries to the follower
 	// having a double role: both sending a heartbeat,
@@ -1512,10 +1495,6 @@ func (rf *Raft) sendHeartbeat() {
 	// copy nextIndex
 	nextIndexCopy := make([]int, len(rf.nextIndex))
 	copy(nextIndexCopy, rf.nextIndex)
-	// copy matchIndex
-	matchIndexCopy := make([]int, len(rf.matchIndex))
-	copy(matchIndexCopy, rf.matchIndex)
-	_ = matchIndexCopy
 	// copy leader's log
 	logCopy := make([]transport.LogEntry, len(rf.log))
 	copy(logCopy, rf.log)
@@ -1561,7 +1540,7 @@ func (rf *Raft) ticker() {
 		if isLeader {
 			// send heartbeat to the peers
 			// wait until sending the next heartbeat
-			time.Sleep(time.Duration(HEARTBEAT_INTERVAL_MS) * time.Millisecond)
+			time.Sleep(heartbeatInterval)
 			go rf.sendHeartbeat()
 			continue
 		}
@@ -1571,15 +1550,15 @@ func (rf *Raft) ticker() {
 		// if not, start leader election
 		// i.e, the node becomes a candidate and executes the candidate logic
 
-		// pause for a random amount of time between 250 and 500 milliseconds
-		ms := 250 + (rand.Int63() % 250)
-		electionTimeout := time.Duration(ms) * time.Millisecond
+		// pause for a random amount of time in [electionTimeoutMin, electionTimeoutMax)
+		spread := electionTimeoutMax - electionTimeoutMin
+		electionTimeout := electionTimeoutMin + time.Duration(rand.Int63n(int64(spread)))
 
 		time.Sleep(electionTimeout)
 
 		// check latest node state
 		rf.mu.Lock()
-		timeSinceLastHeartbeat := time.Since(rf.lastHeartbit)
+		timeSinceLastHeartbeat := time.Since(rf.lastHeartbeat)
 		isLeader = rf.currentRole == rLeader
 
 		dlog.Dlog(
@@ -1627,10 +1606,9 @@ func (rf *Raft) ticker() {
 func Make(peers []transport.Peer, me int,
 	store storage.Store, applyCh chan ApplyMsg,
 ) (*Raft, error) {
-	// VERY IMPORTANT: I noticed while I was working on the lab that
-	// the lab's testing wrapper doesn't also focus on killing
-	// the already running goroutines
-	// so I needed to account for this kind of cases in the implementation
+	// Callers are responsible for calling Kill() when done so that the
+	// long-running goroutines spawned below shut down cleanly; guard
+	// goroutines with killed() to exit on cancellation.
 
 	rf := &Raft{}
 	rf.peers = peers
@@ -1648,7 +1626,7 @@ func Make(peers []transport.Peer, me int,
 	rf.log = []transport.LogEntry{{Term: 0}}
 
 	rf.commitIndex = 0
-	rf.lastHeartbit = time.Now()
+	rf.lastHeartbeat = time.Now()
 
 	// initialize from state persisted before a crash
 	// force init here, but not sure it's the best approach
