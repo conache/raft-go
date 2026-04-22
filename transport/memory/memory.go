@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/conache/raft-go/transport"
 )
@@ -37,6 +38,37 @@ type Mesh struct {
 	disconnected map[[2]int]bool
 	dropRate     float64
 	rng          *rand.Rand
+
+	// Counters, incremented by Peer.Call for test-time visibility via Stats().
+	// methodCounts is keyed by whatever method name the caller passes; the
+	// mesh stays agnostic to the service on top of it.
+	totalCalls   atomic.Int64
+	dropped      atomic.Int64
+	methodMu     sync.Mutex
+	methodCounts map[string]int64
+}
+
+// Stats is a snapshot of a mesh's cumulative call counters.
+type Stats struct {
+	Calls    int64
+	Dropped  int64
+	ByMethod map[string]int64
+}
+
+// Stats returns a snapshot of the mesh's counters. The ByMethod map is a
+// copy safe for the caller to mutate or retain.
+func (m *Mesh) Stats() Stats {
+	m.methodMu.Lock()
+	defer m.methodMu.Unlock()
+	byMethod := make(map[string]int64, len(m.methodCounts))
+	for k, v := range m.methodCounts {
+		byMethod[k] = v
+	}
+	return Stats{
+		Calls:    m.totalCalls.Load(),
+		Dropped:  m.dropped.Load(),
+		ByMethod: byMethod,
+	}
 }
 
 // Option configures a Mesh at construction.
@@ -61,6 +93,7 @@ func NewMesh(n int, opts ...Option) *Mesh {
 		handlers:     make(map[int]any),
 		disconnected: make(map[[2]int]bool),
 		rng:          rand.New(rand.NewSource(1)),
+		methodCounts: make(map[string]int64),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -183,6 +216,7 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return ErrDisconnected
 	}
 	if m.shouldDrop() {
+		m.dropped.Add(1)
 		return ErrDropped
 	}
 
@@ -200,6 +234,13 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 	if !methodValue.IsValid() {
 		return fmt.Errorf("%w: %s", ErrBadMethod, methodName)
 	}
+
+	// Count this dispatch. The per-method counter stays service-agnostic:
+	// the mesh records whatever method name the caller used.
+	m.totalCalls.Add(1)
+	m.methodMu.Lock()
+	m.methodCounts[methodName]++
+	m.methodMu.Unlock()
 
 	mt := methodValue.Type()
 	if mt.NumIn() != 2 {

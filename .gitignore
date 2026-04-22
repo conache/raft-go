@@ -1,0 +1,18 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Log captures
+*.log
+
+# Python virtualenvs for tools/dslogs.py
+.venv/
+venv/
+
+# OS droppings
+.DS_Store
+Thumbs.db
