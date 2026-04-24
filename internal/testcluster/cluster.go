@@ -680,12 +680,6 @@ func (c *Cluster) SetReliable(reliable bool) {
 	}
 }
 
-func (c *Cluster) isConnected(i int) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connected[i]
-}
-
 // liveNode atomically returns peer i's node if it is both running and
 // connected, else (nil, false)
 // Callers must use this instead of isLive + c.nodes[i] to avoid a TOCTOU

@@ -2,6 +2,7 @@ package consensus_test
 
 import (
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,14 +364,7 @@ func churn(t *testing.T, reliable bool) {
 
 	// Every value a client observed must still be in the final committed log
 	for _, v := range values {
-		found := false
-		for _, c := range committed {
-			if v == c {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(committed, v) {
 			t.Fatalf("client-observed value %d is missing from the committed log", v)
 		}
 	}
