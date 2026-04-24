@@ -147,7 +147,7 @@ func (c *Cluster) Shutdown() {
 		status = "FAILED"
 	}
 	fmt.Printf(
-		"[%s] time=%s #peers=%d #RPCs=%d [%s] #dropped=%d #Ops=%d\n",
+		"[%s] time=%s #peers=%d #RPCs=%d [%s] #dropped=%d #Ops=%d\n\n",
 		status,
 		elapsed.Round(time.Millisecond),
 		c.n,
@@ -194,8 +194,7 @@ func (c *Cluster) trackApply(i int) {
 				c.appliedMu.Lock()
 				c.appliedCommands[i][msg.CommandIndex] = msg.Command
 				if c.applyFn != nil {
-					c.appliedResults[i][msg.CommandIndex] =
-						c.applyFn(i, msg.CommandIndex, msg.Command)
+					c.appliedResults[i][msg.CommandIndex] = c.applyFn(i, msg.CommandIndex, msg.Command)
 				}
 				c.appliedMu.Unlock()
 			}
@@ -284,23 +283,47 @@ func (c *Cluster) CheckNoLeader() {
 	}
 }
 
-// CheckTerms asserts all connected peers agree on a single term and
-// returns it. Fails the test on disagreement.
+// CheckTerms polls connected peers until they agree on a single term,
+// retrying up to checkLeaderRetries times at checkLeaderInterval spacing.
+// Returns the agreed term. Fails the test if terms never converge —
+// disagreement is often transient (a peer hasn't yet seen the current
+// leader's heartbeat after a reconnect), so a hard single-shot check
+// races with normal heartbeat propagation.
 func (c *Cluster) CheckTerms() int {
 	c.t.Helper()
-	term := -1
+	var lastSeen []int
+	for range checkLeaderRetries {
+		terms := c.connectedTerms()
+		if len(terms) > 0 && allEqual(terms) {
+			return terms[0]
+		}
+		lastSeen = terms
+		time.Sleep(checkLeaderInterval)
+	}
+	c.t.Fatalf("peers never agreed on term (last seen: %v)", lastSeen)
+	return -1
+}
+
+// connectedTerms returns the current term reported by each connected peer.
+func (c *Cluster) connectedTerms() []int {
+	terms := make([]int, 0, c.n)
 	for i := range c.n {
 		if !c.isConnected(i) {
 			continue
 		}
-		t, _ := c.nodes[i].GetState()
-		if term == -1 {
-			term = t
-		} else if t != term {
-			c.t.Fatalf("peers disagree on term: %d vs %d", term, t)
+		peerTerm, _ := c.nodes[i].GetState()
+		terms = append(terms, peerTerm)
+	}
+	return terms
+}
+
+func allEqual(xs []int) bool {
+	for i := 1; i < len(xs); i++ {
+		if xs[i] != xs[0] {
+			return false
 		}
 	}
-	return term
+	return true
 }
 
 // NCommitted reports how many peers have applied the command at the given

@@ -62,29 +62,40 @@ func TestElectionReelectsAfterLeaderDisconnect(t *testing.T) {
 // TestElectionStallsWithoutQuorum checks that a cluster without a majority
 // of connected peers cannot elect a leader, and that restoring quorum lets
 // it elect again.
+//
+// A 5-peer cluster is used instead of 3 so that disconnecting 3 peers
+// leaves only 2 connected — which is never a majority of 5 (quorum is 3),
+// regardless of how elections race with the Disconnect calls. A 3-peer
+// cluster here is racy: the window between the two required Disconnects
+// is wide enough for a candidate to win 2 of 3 votes before the leader is
+// isolated, producing a spurious leader that CheckNoLeader then catches.
 func TestElectionStallsWithoutQuorum(t *testing.T) {
-	c := testcluster.New(t, 3)
+	const servers = 5
+	c := testcluster.New(t, servers)
 	defer c.Shutdown()
 
 	leader1 := c.CheckOneLeader()
 
-	// Disconnect the leader and one other peer: only one peer remains, no
-	// quorum. Disconnect the non-leader first so the cluster can't hold an
-	// election in the window between the two calls.
-	other := (leader1 + 1) % 3
-	c.Disconnect(other)
+	// Disconnect three peers including the leader — only 2 remain, below
+	// quorum. Disconnect non-leaders first so any election racing with this
+	// sequence still has the leader available to reject stale requests.
+	others := []int{(leader1 + 1) % servers, (leader1 + 2) % servers}
+	for _, o := range others {
+		c.Disconnect(o)
+	}
 	c.Disconnect(leader1)
 
 	// Wait long enough that any in-flight election times out without a quorum.
 	time.Sleep(2 * 1000 * time.Millisecond)
 	c.CheckNoLeader()
 
-	// Reconnect one of the disconnected peers: quorum returns, so does a leader.
-	c.Connect(other)
+	// Reconnect one: 3 connected, quorum returns, a leader can be elected.
+	c.Connect(others[0])
 	c.CheckOneLeader()
 
-	// Reconnect the last disconnected peer too; a rejoining non-leader should
-	// not disrupt the cluster.
+	// Reconnect the remaining peers; a rejoining non-leader must not disrupt
+	// the cluster.
+	c.Connect(others[1])
 	c.Connect(leader1)
 	c.CheckOneLeader()
 }
@@ -122,13 +133,18 @@ func TestElectionOldLeaderDemotesAfterRejoin(t *testing.T) {
 // single scenario: initial election, leader disconnect, re-election, old
 // leader rejoins, another disconnect takes the cluster below quorum, then
 // peers rejoin one at a time and leadership is restored.
+//
+// Uses a 5-peer cluster for the no-quorum phase (see
+// TestElectionStallsWithoutQuorum for the rationale — 3 peers with 2
+// disconnects is structurally racy, 5 peers with 3 disconnects is not).
 func TestElectionEndToEndRecovery(t *testing.T) {
-	c := testcluster.New(t, 3)
+	const servers = 5
+	c := testcluster.New(t, servers)
 	defer c.Shutdown()
 
 	leader1 := c.CheckOneLeader()
 
-	// Leader disconnects; remaining peers elect a new one.
+	// Leader disconnects; remaining 4 peers elect a new one (quorum 3 of 5).
 	c.Disconnect(leader1)
 	c.CheckOneLeader()
 
@@ -136,20 +152,23 @@ func TestElectionEndToEndRecovery(t *testing.T) {
 	c.Connect(leader1)
 	leader2 := c.CheckOneLeader()
 
-	// Take the new leader and one other peer offline — only one peer
-	// remains, so no quorum and no leader. Disconnect the non-leader first
-	// so an election can't fire between the two calls.
-	other := (leader2 + 1) % 3
-	c.Disconnect(other)
+	// Take 3 peers offline including the current leader — only 2 remain,
+	// below quorum of 5. Disconnect non-leaders first to keep the
+	// sequential-Disconnect window safe.
+	others := []int{(leader2 + 1) % servers, (leader2 + 2) % servers}
+	for _, o := range others {
+		c.Disconnect(o)
+	}
 	c.Disconnect(leader2)
 	time.Sleep(2 * 1000 * time.Millisecond)
 	c.CheckNoLeader()
 
-	// Reconnect one of them: quorum returns, a leader is elected.
-	c.Connect(other)
+	// Reconnect one: 3 connected, quorum returns, a leader is elected.
+	c.Connect(others[0])
 	c.CheckOneLeader()
 
-	// Reconnect the last peer: still one leader.
+	// Reconnect the remaining peers: still one leader.
+	c.Connect(others[1])
 	c.Connect(leader2)
 	c.CheckOneLeader()
 }

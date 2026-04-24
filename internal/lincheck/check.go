@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,17 +87,8 @@ func repoRoot() (string, error) {
 	}
 }
 
-// sanitizeName replaces path separators in t.Name() (e.g. subtests use "/")
-// with underscores so the result is a safe single filename.
-func sanitizeName(name string) string {
-	mapped := make([]rune, 0, len(name))
-	for _, r := range name {
-		switch r {
-		case '/', '\\', ':':
-			mapped = append(mapped, '_')
-		default:
-			mapped = append(mapped, r)
-		}
-	}
-	return string(mapped)
-}
+// pathSafeName maps characters that aren't safe in a single filename (e.g.
+// "/" from subtests via t.Name()) to underscores.
+var pathSafeName = strings.NewReplacer("/", "_", "\\", "_", ":", "_")
+
+func sanitizeName(name string) string { return pathSafeName.Replace(name) }
