@@ -1,8 +1,7 @@
-// Package memory provides an in-process transport that satisfies
-// transport.Peer. It is deterministic, supports partition and drop
-// fault injection, and is intended both for consensus tests and for
-// downstream projects that want to exercise raft-backed code without
-// real networking.
+// Package memory is an in-process transport.Peer implementation
+// Deterministic, supports partition and drop fault injection
+// Used by consensus tests and by downstream projects that want to
+// exercise raft-backed code without real networking
 package memory
 
 import (
@@ -29,34 +28,49 @@ var (
 	ErrBadSignature = errors.New("memory: handler method has wrong signature")
 )
 
-// Mesh is an in-process network of n peers that dispatch calls among
-// themselves. A zero-value Mesh is unusable; construct with NewMesh.
+// Mesh is an in-process network of n peers dispatching calls to each other
+// A zero-value Mesh is unusable; construct with NewMesh
 type Mesh struct {
-	mu           sync.Mutex
-	n            int
-	handlers     map[int]any
+	// Guards handlers, disconnected, and rng
+	mu sync.Mutex
+	// Fixed peer count set at construction
+	n int
+	// Per-peer RPC targets registered via Register; nil slot = no handler yet
+	handlers map[int]any
+	// Canonical-pair keyset of currently severed links, see pair()
 	disconnected map[[2]int]bool
-	dropRate     float64
-	rng          *rand.Rand
+	// Per-call drop probability in [0, 1]; 0 means never drop
+	dropRate float64
+	// RNG consulted by shouldDrop, seeded by WithSeed for determinism
+	rng *rand.Rand
 
-	// Counters, incremented by Peer.Call for test-time visibility via Stats().
-	// methodCounts is keyed by whatever method name the caller passes; the
-	// mesh stays agnostic to the service on top of it.
-	totalCalls   atomic.Int64
-	dropped      atomic.Int64
-	methodMu     sync.Mutex
+	// Cumulative count of dispatched calls
+	totalCalls atomic.Int64
+	// Gob-encoded sizes of args and replies for every dispatched call
+	totalBytes atomic.Int64
+	// Cumulative count of calls the drop-rate filter discarded
+	dropped atomic.Int64
+	// Guards methodCounts
+	methodMu sync.Mutex
+	// Per-method call counters, keyed by whatever method name the caller
+	// passes so the mesh stays agnostic to the service on top of it
 	methodCounts map[string]int64
 }
 
-// Stats is a snapshot of a mesh's cumulative call counters.
+// Stats is a snapshot of a mesh's cumulative call counters
 type Stats struct {
-	Calls    int64
-	Dropped  int64
+	// Total dispatched calls since the mesh was created
+	Calls int64
+	// Total gob-encoded arg + reply bytes across all dispatched calls
+	Bytes int64
+	// Calls that the drop-rate filter discarded
+	Dropped int64
+	// Per-method dispatched-call counts, same keys the caller used
 	ByMethod map[string]int64
 }
 
-// Stats returns a snapshot of the mesh's counters. The ByMethod map is a
-// copy safe for the caller to mutate or retain.
+// Stats returns a snapshot of the mesh's counters
+// ByMethod is a copy safe for the caller to mutate or retain
 func (m *Mesh) Stats() Stats {
 	m.methodMu.Lock()
 	defer m.methodMu.Unlock()
@@ -66,27 +80,27 @@ func (m *Mesh) Stats() Stats {
 	}
 	return Stats{
 		Calls:    m.totalCalls.Load(),
+		Bytes:    m.totalBytes.Load(),
 		Dropped:  m.dropped.Load(),
 		ByMethod: byMethod,
 	}
 }
 
-// Option configures a Mesh at construction.
+// Option configures a Mesh at construction
 type Option func(*Mesh)
 
-// WithDropRate sets the per-call drop probability in [0, 1]. Default is 0.
+// WithDropRate sets the per-call drop probability in [0, 1]; default 0
 func WithDropRate(rate float64) Option {
 	return func(m *Mesh) { m.dropRate = rate }
 }
 
-// WithSeed seeds the internal RNG used for drop decisions. Default seed is
-// 1, making tests reproducible by default.
+// WithSeed seeds the RNG used for drop decisions; default 1 for reproducibility
 func WithSeed(seed int64) Option {
 	return func(m *Mesh) { m.rng = rand.New(rand.NewSource(seed)) }
 }
 
-// NewMesh returns an n-peer mesh. All peers start connected; no calls drop.
-// n is fixed at construction and cannot change at runtime.
+// NewMesh returns an n-peer mesh with all peers connected and no drops
+// n is fixed at construction
 func NewMesh(n int, opts ...Option) *Mesh {
 	m := &Mesh{
 		n:            n,
@@ -101,8 +115,8 @@ func NewMesh(n int, opts ...Option) *Mesh {
 	return m
 }
 
-// Register sets the handler for peer id. Exported methods on the handler
-// become callable via Peer.Call. Typical handler: a *consensus.Raft instance.
+// Register sets the handler for peer id
+// Exported methods on the handler become callable via Peer.Call
 func (m *Mesh) Register(id int, handler any) error {
 	if id < 0 || id >= m.n {
 		return fmt.Errorf("%w: %d not in [0, %d)", ErrOutOfRange, id, m.n)
@@ -113,8 +127,7 @@ func (m *Mesh) Register(id int, handler any) error {
 	return nil
 }
 
-// Peers returns a slice of length n with the peer handles to use from node
-// `from`. peers[i] dispatches to peer i.
+// Peers returns peer handles indexed by target id, for use from node `from`
 func (m *Mesh) Peers(from int) []transport.Peer {
 	out := make([]transport.Peer, m.n)
 	for i := range m.n {
@@ -123,7 +136,7 @@ func (m *Mesh) Peers(from int) []transport.Peer {
 	return out
 }
 
-// Connect restores the bidirectional link between i and j. No-op if i == j.
+// Connect restores the bidirectional link between i and j; no-op if i == j
 func (m *Mesh) Connect(i, j int) {
 	if i == j {
 		return
@@ -133,7 +146,7 @@ func (m *Mesh) Connect(i, j int) {
 	delete(m.disconnected, pair(i, j))
 }
 
-// Disconnect breaks the bidirectional link between i and j. No-op if i == j.
+// Disconnect breaks the bidirectional link between i and j; no-op if i == j
 func (m *Mesh) Disconnect(i, j int) {
 	if i == j {
 		return
@@ -143,7 +156,7 @@ func (m *Mesh) Disconnect(i, j int) {
 	m.disconnected[pair(i, j)] = true
 }
 
-// Isolate disconnects i from all other peers.
+// Isolate disconnects i from all other peers
 func (m *Mesh) Isolate(i int) {
 	for j := range m.n {
 		if i != j {
@@ -152,7 +165,7 @@ func (m *Mesh) Isolate(i int) {
 	}
 }
 
-// Heal reconnects i to all other peers.
+// Heal reconnects i to all other peers
 func (m *Mesh) Heal(i int) {
 	for j := range m.n {
 		if i != j {
@@ -161,8 +174,7 @@ func (m *Mesh) Heal(i int) {
 	}
 }
 
-// pair returns a canonical [min, max] pair used as a map key so a single
-// entry captures both directions.
+// pair returns a canonical [min, max] key so one map entry covers both directions
 func pair(i, j int) [2]int {
 	if i < j {
 		return [2]int{i, j}
@@ -194,18 +206,21 @@ func (m *Mesh) handlerFor(id int) any {
 	return m.handlers[id]
 }
 
-// Peer is a handle for sending RPCs from one node to another.
-// It implements transport.Peer.
+// Peer is a handle for sending RPCs from one node to another;
+// it implements transport.Peer
 type Peer struct {
+	// Back-reference to the mesh the call is dispatched through
 	mesh *Mesh
+	// Caller peer id, used to look up the (from, to) link state
 	from int
-	to   int
+	// Target peer id; Call dispatches to the handler registered at this id
+	to int
 }
 
-// Call implements transport.Peer.Call. It serializes args via gob,
-// dispatches to the target handler's method in a separate goroutine so a
-// held mutex on the callee cannot deadlock the caller, and deserializes the
-// reply back. The caller's ctx is honored for cancellation.
+// Call implements transport.Peer.Call
+// Serializes args via gob, dispatches in a goroutine so a held callee mutex
+// can't deadlock the caller, then deserializes the reply back
+// Honors ctx for cancellation
 func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 	m := p.mesh
 
@@ -235,8 +250,7 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return fmt.Errorf("%w: %s", ErrBadMethod, methodName)
 	}
 
-	// Count this dispatch. The per-method counter stays service-agnostic:
-	// the mesh records whatever method name the caller used.
+	// Record the dispatch; mesh stays service-agnostic by keying on the caller's name
 	m.totalCalls.Add(1)
 	m.methodMu.Lock()
 	m.methodCounts[methodName]++
@@ -250,10 +264,10 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return fmt.Errorf("%w: %s: params must be pointers", ErrBadSignature, methodName)
 	}
 
-	// Round-trip args into a fresh instance so the handler cannot mutate the
-	// caller's struct. Mirrors wire serialization.
+	// Round-trip args into a fresh instance so handler mutations don't alias back
 	argCopy := reflect.New(mt.In(0).Elem())
-	if err := gobRoundTrip(args, argCopy.Interface()); err != nil {
+	argBytes, err := gobRoundTrip(args, argCopy.Interface())
+	if err != nil {
 		return fmt.Errorf("memory: encoding args: %w", err)
 	}
 	replyCopy := reflect.New(mt.In(1).Elem())
@@ -278,18 +292,24 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return ctx.Err()
 	}
 
-	if err := gobRoundTrip(replyCopy.Interface(), reply); err != nil {
+	replyBytes, err := gobRoundTrip(replyCopy.Interface(), reply)
+	if err != nil {
 		return fmt.Errorf("memory: decoding reply: %w", err)
 	}
+	m.totalBytes.Add(int64(argBytes + replyBytes))
 	return nil
 }
 
-// gobRoundTrip encodes src and decodes into dst through a single buffer.
-// Used so handler mutations don't alias back to the caller's structs.
-func gobRoundTrip(src, dst any) error {
+// gobRoundTrip encodes src and decodes into dst through a single buffer
+// Returns the encoded size so callers can account for wire cost
+func gobRoundTrip(src, dst any) (int, error) {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(src); err != nil {
-		return err
+		return 0, err
 	}
-	return gob.NewDecoder(&buf).Decode(dst)
+	n := buf.Len()
+	if err := gob.NewDecoder(&buf).Decode(dst); err != nil {
+		return n, err
+	}
+	return n, nil
 }

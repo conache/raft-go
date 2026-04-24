@@ -8,9 +8,8 @@ import (
 	"github.com/anishathalye/porcupine"
 )
 
-// RegOpKind distinguishes the operations the single-register FSM supports.
-// Defined as a named string so it's human-readable in logs and Porcupine
-// diagnostics without any extra Stringer boilerplate.
+// RegOpKind tags a single-register operation
+// Named string so logs and Porcupine diagnostics stay readable
 type RegOpKind string
 
 const (
@@ -18,29 +17,30 @@ const (
 	RegOpPut RegOpKind = "put"
 )
 
-// RegOp is a single-register command. Value is only meaningful for
-// RegOpPut. Registered with gob so it round-trips through the in-memory
-// transport's serialization.
+// RegOp is a single-register command
+// Registered with gob so it round-trips through the in-memory transport
 type RegOp struct {
-	Kind  RegOpKind
+	// RegOpGet or RegOpPut
+	Kind RegOpKind
+	// Only meaningful for RegOpPut; ignored for RegOpGet
 	Value int
 }
 
 func init() { gob.Register(RegOp{}) }
 
-// RegisterFSM is a single-int register state machine. Each cluster node
-// holds its own; because Raft delivers applies in log order, all copies
-// converge to the same sequence of states.
+// RegisterFSM is a single-int register state machine
+// Each cluster node holds its own; log-ordered applies keep copies in sync
 type RegisterFSM struct {
-	mu  sync.Mutex
+	// Guards val
+	mu sync.Mutex
+	// Current register value, mutated by RegOpPut and read by RegOpGet
 	val int
 }
 
-// NewRegisterFSM returns an FSM initialized to zero.
+// NewRegisterFSM returns an FSM initialized to zero
 func NewRegisterFSM() *RegisterFSM { return &RegisterFSM{} }
 
-// Apply executes op against the register and returns the value that
-// RegOpPut or RegOpGet would conventionally yield.
+// Apply executes op and returns the value the caller should observe
 func (s *RegisterFSM) Apply(op RegOp) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,7 +55,7 @@ func (s *RegisterFSM) Apply(op RegOp) int {
 	}
 }
 
-// RegisterModel is the Porcupine model matching RegisterFSM's semantics.
+// RegisterModel is the Porcupine model matching RegisterFSM's semantics
 var RegisterModel = porcupine.Model{
 	Init: func() any { return 0 },
 	Step: func(state, input, output any) (bool, any) {

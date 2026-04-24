@@ -11,18 +11,14 @@ import (
 	"github.com/anishathalye/porcupine"
 )
 
-// visDir is the directory (relative to repo root) where failing histories
-// are dumped as interactive HTML. Created on demand.
+// Output directory (under repo root) for failing-history HTML dumps
 const visDir = "debug/porcupine"
 
-// Check runs Porcupine's linearizability check against log under model.
+// Check runs Porcupine's linearizability check against log under model
 // Verdicts:
-//
-//   - Ok: pass silently.
-//   - Unknown: checker timed out; log a warning and pass (Porcupine is
-//     worst-case exponential, a timeout is not a bug).
-//   - Illegal: write an interactive HTML visualization of the history to
-//     debug/porcupine/<test-name>.html at the repo root and fail the test.
+//   - Ok: pass silently
+//   - Unknown: checker timed out; log a warning and pass
+//   - Illegal: write an HTML visualization under visDir and fail the test
 func Check(t *testing.T, model porcupine.Model, log *OpLog, timeout time.Duration) {
 	t.Helper()
 	result, info := porcupine.CheckOperationsVerbose(model, log.Read(), timeout)
@@ -41,10 +37,8 @@ func Check(t *testing.T, model porcupine.Model, log *OpLog, timeout time.Duratio
 	}
 }
 
-// writeVisualization dumps info as an HTML visualization under
-// <repoRoot>/debug/porcupine/ and returns the absolute path. The filename
-// is prefixed with a sortable timestamp so successive runs don't clobber
-// each other and `ls` orders them chronologically.
+// writeVisualization dumps info as HTML under <repoRoot>/debug/porcupine/
+// Filename is prefixed with a sortable timestamp so runs don't clobber each other
 func writeVisualization(model porcupine.Model, info porcupine.LinearizationInfo, name string) (string, error) {
 	root, err := repoRoot()
 	if err != nil {
@@ -54,7 +48,7 @@ func writeVisualization(model porcupine.Model, info porcupine.LinearizationInfo,
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	// Format: 20260424-141523.847_TestName.html — sortable by ls/time.
+	// Format: 20260424-141523.847_TestName.html, sortable by ls/time
 	stamp := time.Now().Format("20060102-150405.000")
 	path := filepath.Join(dir, fmt.Sprintf("%s_%s.html", stamp, sanitizeName(name)))
 	f, err := os.Create(path)
@@ -68,8 +62,7 @@ func writeVisualization(model porcupine.Model, info porcupine.LinearizationInfo,
 	return path, nil
 }
 
-// repoRoot walks up from the current working directory until it finds a
-// go.mod, which we treat as the repo root.
+// repoRoot walks up from cwd until it finds a go.mod, which marks the repo root
 func repoRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -87,8 +80,8 @@ func repoRoot() (string, error) {
 	}
 }
 
-// pathSafeName maps characters that aren't safe in a single filename (e.g.
-// "/" from subtests via t.Name()) to underscores.
+// pathSafeName escapes characters unsafe in a single filename
+// For example "/" from subtests via t.Name()
 var pathSafeName = strings.NewReplacer("/", "_", "\\", "_", ":", "_")
 
 func sanitizeName(name string) string { return pathSafeName.Replace(name) }

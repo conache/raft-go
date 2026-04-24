@@ -1,6 +1,5 @@
-// Package testcluster wires N consensus.Node instances to a shared in-memory
-// mesh and per-node in-memory stores for integration testing. It provides
-// the assertion helpers consensus tests rely on.
+// Package testcluster spins up an in-memory Raft cluster for tests
+// and exposes the assertion helpers used by consensus tests
 package testcluster
 
 import (
@@ -18,58 +17,69 @@ import (
 	memtransport "github.com/conache/raft-go/transport/memory"
 )
 
-// CheckOneLeader's retry budget. checkLeaderRetries * checkLeaderInterval
-// should comfortably exceed one election timeout plus a vote round-trip so
-// that in-flight elections resolve before we give up.
+// CheckOneLeader's retry budget;
+// total wait must exceed one election timeout + a vote round-trip
 const (
 	checkLeaderRetries  = 20
 	checkLeaderInterval = 100 * time.Millisecond
 )
 
 const (
-	oneOuterTimeout = 10 * time.Second
+	// Budget for One() to find a leader and commit; 15s absorbs long
+	// log-backup runs under -race without masking real liveness bugs
+	oneOuterTimeout = 15 * time.Second
+	// Budget for a single commit attempt after a leader accepts the proposal
 	oneInnerTimeout = 2 * time.Second
+	// Spacing between commit-state polls
 	onePollInterval = 20 * time.Millisecond
 )
 
-// Cluster is an n-node Raft cluster backed by an in-memory mesh.
+// Cluster is an n-node Raft cluster backed by an in-memory mesh
 type Cluster struct {
-	t         *testing.T
-	n         int
-	mesh      *memtransport.Mesh
-	stores    []*memstorage.Store
-	nodes     []*consensus.Node
-	applyChs  []chan consensus.ApplyMsg
+	t *testing.T
+	// Fixed peer count
+	n int
+	// Shared in-memory transport for all peers
+	mesh *memtransport.Mesh
+	// Per-peer persistence, indexed by peer id
+	stores []*memstorage.Store
+	// Per-peer Raft node, indexed by peer id
+	nodes []*consensus.Node
+	// Per-peer apply channel, drained by trackApply
+	applyChs []chan consensus.ApplyMsg
+	// Cluster boot time, used for the Shutdown summary line
 	startedAt time.Time
 
-	mu        sync.Mutex
+	// Guards connected and the drain-goroutine bookkeeping
+	mu sync.Mutex
+	// Per-peer connection state mirroring the mesh
 	connected []bool
-	done      chan struct{}
-	drainWG   sync.WaitGroup
+	// Closed by Shutdown to stop trackApply goroutines
+	done chan struct{}
+	// Waits for all trackApply goroutines to exit
+	drainWG sync.WaitGroup
 
-	// All apply-time state is guarded by appliedMu. When applyFn is set
-	// via WithApply, every committed command is fed through it and the
-	// returned value stashed in appliedResults, letting linearizability
-	// tests retrieve "what did the state machine return for this op".
-	appliedMu       sync.Mutex
+	// Guards every apply-state field below
+	appliedMu sync.Mutex
+	// Committed commands per (peer, log index)
 	appliedCommands []map[int]any
-	appliedResults  []map[int]any
-	applyFn         func(nodeIdx, index int, cmd any) any
+	// FSM outputs per (peer, log index) when WithApply is set
+	appliedResults []map[int]any
+	// Per-commit callback driving appliedResults
+	applyFn func(nodeIdx, index int, cmd any) any
 
+	// Count of One/StartOn invocations, printed in the Shutdown summary
 	opsCount atomic.Int64
 }
 
-// N returns the cluster size.
+// N returns the cluster size
 func (c *Cluster) N() int { return c.n }
 
-// Option configures a Cluster at construction.
+// Option configures a Cluster at construction
 type Option func(*Cluster)
 
-// WithApply hooks a state-machine function into the apply pipeline. Every
-// committed command is fed through fn on each node; the returned value is
-// stashed per (nodeIdx, index) and retrievable via Result / AnyResult.
-// The same function runs on every node — nodes are distinguished via the
-// nodeIdx argument.
+// WithApply runs fn on every committed command and stores the result
+// Retrievable via Result / AnyResult; nodes are distinguished by nodeIdx
 func WithApply(fn func(nodeIdx, index int, cmd any) any) Option {
 	return func(c *Cluster) {
 		c.applyFn = fn
@@ -80,7 +90,8 @@ func WithApply(fn func(nodeIdx, index int, cmd any) any) Option {
 	}
 }
 
-// New builds and starts an n-node cluster. Caller must defer Shutdown.
+// New builds and starts an n-node cluster and returns it
+// Caller must defer Shutdown
 func New(t *testing.T, n int, opts ...Option) *Cluster {
 	t.Helper()
 	c := &Cluster{
@@ -99,15 +110,13 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 		c.appliedCommands[i] = make(map[int]any)
 	}
 
-	// Options run before any node is created so applyFn (if provided) is
-	// set before trackApply goroutines start consuming commits.
+	// Apply options before any trackApply goroutine starts consuming commits
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	// Create all nodes first; register handlers after so no peer can issue
-	// an RPC to an unregistered target. The ~250ms election timeout gives
-	// us a wide window to complete this setup.
+	// Create nodes first, register handlers after, so no peer can dispatch
+	// an RPC to an unregistered target before the setup completes
 	for i := range n {
 		c.stores[i] = memstorage.New()
 		c.applyChs[i] = make(chan consensus.ApplyMsg, 256)
@@ -129,8 +138,8 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 	return c
 }
 
-// Shutdown kills every node, stops the drain goroutines, and prints a
-// single-line summary of cluster-level stats for post-test visibility.
+// Shutdown kills every node, stops drain goroutines,
+// and prints a one-line summary of cluster-level stats
 func (c *Cluster) Shutdown() {
 	elapsed := time.Since(c.startedAt)
 	close(c.done)
@@ -158,8 +167,8 @@ func (c *Cluster) Shutdown() {
 	)
 }
 
-// formatByMethod renders the per-method counts deterministically:
-// "MethodA=3 MethodB=7" with keys sorted alphabetically.
+// formatByMethod renders per-method counts as "MethodA=3 MethodB=7",
+// keys sorted alphabetically for stable output
 func formatByMethod(m map[string]int64) string {
 	if len(m) == 0 {
 		return ""
@@ -179,12 +188,9 @@ func formatByMethod(m map[string]int64) string {
 	return sb.String()
 }
 
-// trackApply records every committed command each peer applies so tests
-// can later ask "how many peers committed index N, and what value?". If a
-// state-machine function was registered via WithApply, each committed
-// command is fed through it and the result stored alongside.
-// Snapshot messages are acknowledged (kept draining) but not yet handled
-// — snapshot-aware tests will extend this.
+// trackApply drains peer i's apply channel and records committed commands
+// If WithApply is set, also feeds each command through applyFn
+// Snapshot messages are drained but not yet handled
 func (c *Cluster) trackApply(i int) {
 	defer c.drainWG.Done()
 	for {
@@ -205,8 +211,8 @@ func (c *Cluster) trackApply(i int) {
 	}
 }
 
-// Result returns the state-machine output recorded for (nodeIdx, index),
-// or (nil, false) if that node hasn't applied that index yet.
+// Result returns the FSM output at (nodeIdx, index),
+// or (nil, false) if that node hasn't applied the index yet
 func (c *Cluster) Result(nodeIdx, index int) (any, bool) {
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
@@ -217,8 +223,8 @@ func (c *Cluster) Result(nodeIdx, index int) (any, bool) {
 	return r, ok
 }
 
-// AnyResult returns the first recorded state-machine output for index
-// across all nodes, or (nil, false) if no node has applied it yet.
+// AnyResult returns the first FSM output for index across all nodes,
+// or (nil, false) if no node has applied it yet
 func (c *Cluster) AnyResult(index int) (any, bool) {
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
@@ -233,9 +239,9 @@ func (c *Cluster) AnyResult(index int) (any, bool) {
 	return nil, false
 }
 
-// CheckOneLeader confirms exactly one connected peer believes it is the
-// leader, retrying up to checkLeaderRetries times at checkLeaderInterval
-// spacing so that in-flight elections have time to resolve.
+// CheckOneLeader confirms exactly one connected peer claims leadership
+// Retries so in-flight elections have time to resolve
+// Returns the leader's peer id; fails the test if no leader emerges
 func (c *Cluster) CheckOneLeader() int {
 	c.t.Helper()
 	for range checkLeaderRetries {
@@ -270,7 +276,7 @@ func (c *Cluster) CheckOneLeader() int {
 	return -1
 }
 
-// CheckNoLeader fails the test if any connected peer claims leadership.
+// CheckNoLeader fails the test if any connected peer claims leadership
 func (c *Cluster) CheckNoLeader() {
 	c.t.Helper()
 	for i := range c.n {
@@ -283,12 +289,9 @@ func (c *Cluster) CheckNoLeader() {
 	}
 }
 
-// CheckTerms polls connected peers until they agree on a single term,
-// retrying up to checkLeaderRetries times at checkLeaderInterval spacing.
-// Returns the agreed term. Fails the test if terms never converge —
-// disagreement is often transient (a peer hasn't yet seen the current
-// leader's heartbeat after a reconnect), so a hard single-shot check
-// races with normal heartbeat propagation.
+// CheckTerms polls connected peers until they agree on a single term
+// Returns the agreed term; fails if terms never converge
+// Disagreement is often transient (heartbeat hasn't reached a rejoined peer yet)
 func (c *Cluster) CheckTerms() int {
 	c.t.Helper()
 	var lastSeen []int
@@ -304,7 +307,7 @@ func (c *Cluster) CheckTerms() int {
 	return -1
 }
 
-// connectedTerms returns the current term reported by each connected peer.
+// connectedTerms returns the current term reported by each connected peer
 func (c *Cluster) connectedTerms() []int {
 	terms := make([]int, 0, c.n)
 	for i := range c.n {
@@ -326,8 +329,67 @@ func allEqual(xs []int) bool {
 	return true
 }
 
-// NCommitted reports how many peers have applied the command at the given
-// log index, and what that command's value is
+// StartOn proposes cmd directly on peer i
+// Lets tests target a specific (possibly disconnected) peer instead of
+// letting One() auto-discover the current leader
+// Returns Start's (index, term, isLeader) verbatim
+func (c *Cluster) StartOn(i int, cmd any) (index, term int, isLeader bool) {
+	c.opsCount.Add(1)
+	return c.nodes[i].Start(cmd)
+}
+
+// Term returns peer i's current term
+func (c *Cluster) Term(i int) int {
+	t, _ := c.nodes[i].GetState()
+	return t
+}
+
+// RPCCount returns total RPCs delivered across the cluster since startup
+func (c *Cluster) RPCCount() int64 { return c.mesh.Stats().Calls }
+
+// BytesTotal returns cumulative gob-encoded bytes of RPC args + replies
+func (c *Cluster) BytesTotal() int64 { return c.mesh.Stats().Bytes }
+
+// Wait polls until expectedPeers have applied a command at index
+// Returns the committed value, or -1 if startTerm is passed and any peer advances beyond it
+// Fails the test if the index never reaches the expected peer count
+func (c *Cluster) Wait(index, expectedPeers, startTerm int) any {
+	c.t.Helper()
+	to := 10 * time.Millisecond
+	for range 30 {
+		n, _ := c.NCommitted(index)
+		if n >= expectedPeers {
+			break
+		}
+		time.Sleep(to)
+		if to < time.Second {
+			to *= 2
+		}
+		if startTerm >= 0 {
+			for i := range c.n {
+				if c.Term(i) > startTerm {
+					return -1
+				}
+			}
+		}
+	}
+	n, cmd := c.NCommitted(index)
+	if n < expectedPeers {
+		c.t.Fatalf("Wait: only %d peers committed index %d, want %d", n, index, expectedPeers)
+	}
+	return cmd
+}
+
+// CheckNoAgreement fails the test if any peer has committed at the given index
+func (c *Cluster) CheckNoAgreement(index int) {
+	c.t.Helper()
+	n, _ := c.NCommitted(index)
+	if n > 0 {
+		c.t.Fatalf("%d peer(s) committed at index %d, expected none", n, index)
+	}
+}
+
+// NCommitted returns how many peers applied index, and the command value
 func (c *Cluster) NCommitted(index int) (int, any) {
 	c.t.Helper()
 	c.appliedMu.Lock()
@@ -354,38 +416,25 @@ func (c *Cluster) NCommitted(index int) (int, any) {
 	return count, committed
 }
 
-// One submits cmd to the leader and waits for at least expectedPeers to
-// commit it. If retry is true, it re-tries on a new leader when the
-// current one loses leadership or fails to commit within the inner
-// timeout. Returns the log index where cmd was committed.
+// One submits cmd and waits for expectedPeers to commit it at one index
+// Polls for a leader within oneOuterTimeout, then waits oneInnerTimeout per attempt
+// retry=true restarts the leader lookup when a commit attempt expires
+// Returns the committed log index
 func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
 	c.t.Helper()
 	c.opsCount.Add(1)
 
 	deadline := time.Now().Add(oneOuterTimeout)
 	for time.Now().Before(deadline) {
-		idx := -1
-		for i := range c.n {
-			if !c.isConnected(i) {
-				continue
-			}
-			proposedIdx, _, isLeader := c.nodes[i].Start(cmd)
-			if isLeader {
-				idx = proposedIdx
-				break
-			}
-		}
+		idx := c.proposeOnLeader(cmd)
 		if idx < 0 {
-			// No leader right now; either retry after a short wait or fail.
-			if !retry {
-				c.t.Fatalf("One: no leader available for cmd %v", cmd)
-			}
+			// No leader right now; always transient, retry within the outer deadline
 			time.Sleep(onePollInterval)
 			continue
 		}
 
-		// Wait for expectedPeers to apply cmd at idx. If a different leader
-		// wins and overwrites idx with something else, break out and retry.
+		// Wait for expectedPeers to apply cmd at idx
+		// If a new leader overwrites idx, bail out and retry
 		innerDeadline := time.Now().Add(oneInnerTimeout)
 		for time.Now().Before(innerDeadline) {
 			count, committed := c.NCommitted(idx)
@@ -405,7 +454,21 @@ func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
 	return -1
 }
 
-// Disconnect isolates peer i from the rest of the cluster.
+// proposeOnLeader tries every connected peer once and returns the log
+// index a leader accepted cmd at, or -1 if no peer claimed leadership
+func (c *Cluster) proposeOnLeader(cmd any) int {
+	for i := range c.n {
+		if !c.isConnected(i) {
+			continue
+		}
+		if idx, _, isLeader := c.nodes[i].Start(cmd); isLeader {
+			return idx
+		}
+	}
+	return -1
+}
+
+// Disconnect isolates peer i from the rest of the cluster
 func (c *Cluster) Disconnect(i int) {
 	c.mu.Lock()
 	c.connected[i] = false
@@ -413,7 +476,7 @@ func (c *Cluster) Disconnect(i int) {
 	c.mesh.Isolate(i)
 }
 
-// Connect reconnects peer i to every other peer.
+// Connect reconnects peer i to every other peer
 func (c *Cluster) Connect(i int) {
 	c.mu.Lock()
 	c.connected[i] = true
