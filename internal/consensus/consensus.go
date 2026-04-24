@@ -19,11 +19,16 @@ import (
 // Timing parameters. rpcTimeout must be less than electionTimeoutMin so
 // that a failed RPC can be retried (or abandoned) before an election
 // timeout fires elsewhere in the cluster.
+//
+// Election timeouts are intentionally generous (500-1000ms) so the
+// integration tests stay stable under `go test -race`, which can slow
+// goroutine scheduling enough that heartbeats occasionally arrive past a
+// tighter timeout and trigger spurious re-elections.
 const (
 	heartbeatInterval  = 100 * time.Millisecond
 	rpcTimeout         = 150 * time.Millisecond
-	electionTimeoutMin = 250 * time.Millisecond
-	electionTimeoutMax = 500 * time.Millisecond
+	electionTimeoutMin = 500 * time.Millisecond
+	electionTimeoutMax = 1000 * time.Millisecond
 )
 
 type nodeRole string

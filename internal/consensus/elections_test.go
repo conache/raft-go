@@ -27,7 +27,7 @@ func TestElectionEmergesOnBoot(t *testing.T) {
 	// Without failures, the leader and term should stay stable across a
 	// couple of election-timeout windows.
 	// We don't expect the term to change
-	time.Sleep(2 * 500 * time.Millisecond)
+	time.Sleep(2 * 1000 * time.Millisecond)
 	term2 := c.CheckTerms()
 	if term1 != term2 {
 		t.Logf("warning: term changed %d -> %d with no failures", term1, term2)
@@ -76,7 +76,7 @@ func TestElectionStallsWithoutQuorum(t *testing.T) {
 	c.Disconnect(leader1)
 
 	// Wait long enough that any in-flight election times out without a quorum.
-	time.Sleep(2 * 500 * time.Millisecond)
+	time.Sleep(2 * 1000 * time.Millisecond)
 	c.CheckNoLeader()
 
 	// Reconnect one of the disconnected peers: quorum returns, so does a leader.
@@ -142,7 +142,7 @@ func TestElectionEndToEndRecovery(t *testing.T) {
 	other := (leader2 + 1) % 3
 	c.Disconnect(other)
 	c.Disconnect(leader2)
-	time.Sleep(2 * 500 * time.Millisecond)
+	time.Sleep(2 * 1000 * time.Millisecond)
 	c.CheckNoLeader()
 
 	// Reconnect one of them: quorum returns, a leader is elected.

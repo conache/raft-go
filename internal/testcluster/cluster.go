@@ -48,7 +48,7 @@ type Cluster struct {
 	drainWG   sync.WaitGroup
 
 	// All apply-time state is guarded by appliedMu. When applyFn is set
-	// via SetApply, every committed command is fed through it and the
+	// via WithApply, every committed command is fed through it and the
 	// returned value stashed in appliedResults, letting linearizability
 	// tests retrieve "what did the state machine return for this op".
 	appliedMu       sync.Mutex
@@ -62,8 +62,26 @@ type Cluster struct {
 // N returns the cluster size.
 func (c *Cluster) N() int { return c.n }
 
+// Option configures a Cluster at construction.
+type Option func(*Cluster)
+
+// WithApply hooks a state-machine function into the apply pipeline. Every
+// committed command is fed through fn on each node; the returned value is
+// stashed per (nodeIdx, index) and retrievable via Result / AnyResult.
+// The same function runs on every node — nodes are distinguished via the
+// nodeIdx argument.
+func WithApply(fn func(nodeIdx, index int, cmd any) any) Option {
+	return func(c *Cluster) {
+		c.applyFn = fn
+		c.appliedResults = make([]map[int]any, c.n)
+		for i := range c.n {
+			c.appliedResults[i] = make(map[int]any)
+		}
+	}
+}
+
 // New builds and starts an n-node cluster. Caller must defer Shutdown.
-func New(t *testing.T, n int) *Cluster {
+func New(t *testing.T, n int, opts ...Option) *Cluster {
 	t.Helper()
 	c := &Cluster{
 		t:               t,
@@ -79,6 +97,12 @@ func New(t *testing.T, n int) *Cluster {
 	}
 	for i := range n {
 		c.appliedCommands[i] = make(map[int]any)
+	}
+
+	// Options run before any node is created so applyFn (if provided) is
+	// set before trackApply goroutines start consuming commits.
+	for _, opt := range opts {
+		opt(c)
 	}
 
 	// Create all nodes first; register handlers after so no peer can issue
@@ -157,7 +181,7 @@ func formatByMethod(m map[string]int64) string {
 
 // trackApply records every committed command each peer applies so tests
 // can later ask "how many peers committed index N, and what value?". If a
-// state-machine function was registered via SetApply, each committed
+// state-machine function was registered via WithApply, each committed
 // command is fed through it and the result stored alongside.
 // Snapshot messages are acknowledged (kept draining) but not yet handled
 // — snapshot-aware tests will extend this.
@@ -179,20 +203,6 @@ func (c *Cluster) trackApply(i int) {
 		case <-c.done:
 			return
 		}
-	}
-}
-
-// SetApply registers a state-machine function to run on every committed
-// command. The returned value is stashed per (node, index) and retrievable
-// via Result. Must be called before any commands flow (typically right
-// after New). Safe to call at most once.
-func (c *Cluster) SetApply(fn func(nodeIdx, index int, cmd any) any) {
-	c.appliedMu.Lock()
-	defer c.appliedMu.Unlock()
-	c.applyFn = fn
-	c.appliedResults = make([]map[int]any, c.n)
-	for i := range c.n {
-		c.appliedResults[i] = make(map[int]any)
 	}
 }
 
