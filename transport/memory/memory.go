@@ -10,6 +10,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -74,10 +75,7 @@ type Stats struct {
 func (m *Mesh) Stats() Stats {
 	m.methodMu.Lock()
 	defer m.methodMu.Unlock()
-	byMethod := make(map[string]int64, len(m.methodCounts))
-	for k, v := range m.methodCounts {
-		byMethod[k] = v
-	}
+	byMethod := maps.Clone(m.methodCounts)
 	return Stats{
 		Calls:    m.totalCalls.Load(),
 		Bytes:    m.totalBytes.Load(),
@@ -92,6 +90,14 @@ type Option func(*Mesh)
 // WithDropRate sets the per-call drop probability in [0, 1]; default 0
 func WithDropRate(rate float64) Option {
 	return func(m *Mesh) { m.dropRate = rate }
+}
+
+// SetDropRate changes the per-call drop probability at runtime
+// Use it to toggle reliable/unreliable modes mid-test
+func (m *Mesh) SetDropRate(rate float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dropRate = rate
 }
 
 // WithSeed seeds the RNG used for drop decisions; default 1 for reproducibility

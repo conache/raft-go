@@ -249,7 +249,7 @@ func (c *Cluster) CheckOneLeader() int {
 
 		leadersByTerm := map[int][]int{}
 		for i := range c.n {
-			if !c.isConnected(i) {
+			if !c.isLive(i) {
 				continue
 			}
 			term, isLeader := c.nodes[i].GetState()
@@ -276,11 +276,11 @@ func (c *Cluster) CheckOneLeader() int {
 	return -1
 }
 
-// CheckNoLeader fails the test if any connected peer claims leadership
+// CheckNoLeader fails the test if any live peer claims leadership
 func (c *Cluster) CheckNoLeader() {
 	c.t.Helper()
 	for i := range c.n {
-		if !c.isConnected(i) {
+		if !c.isLive(i) {
 			continue
 		}
 		if _, isLeader := c.nodes[i].GetState(); isLeader {
@@ -307,11 +307,11 @@ func (c *Cluster) CheckTerms() int {
 	return -1
 }
 
-// connectedTerms returns the current term reported by each connected peer
+// connectedTerms returns the current term reported by each live peer
 func (c *Cluster) connectedTerms() []int {
 	terms := make([]int, 0, c.n)
 	for i := range c.n {
-		if !c.isConnected(i) {
+		if !c.isLive(i) {
 			continue
 		}
 		peerTerm, _ := c.nodes[i].GetState()
@@ -338,8 +338,11 @@ func (c *Cluster) StartOn(i int, cmd any) (index, term int, isLeader bool) {
 	return c.nodes[i].Start(cmd)
 }
 
-// Term returns peer i's current term
+// Term returns peer i's current term, or -1 if the peer is currently killed
 func (c *Cluster) Term(i int) int {
+	if !c.IsRunning(i) {
+		return -1
+	}
 	t, _ := c.nodes[i].GetState()
 	return t
 }
@@ -458,7 +461,7 @@ func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
 // index a leader accepted cmd at, or -1 if no peer claimed leadership
 func (c *Cluster) proposeOnLeader(cmd any) int {
 	for i := range c.n {
-		if !c.isConnected(i) {
+		if !c.isLive(i) {
 			continue
 		}
 		if idx, _, isLeader := c.nodes[i].Start(cmd); isLeader {
@@ -484,8 +487,75 @@ func (c *Cluster) Connect(i int) {
 	c.mesh.Heal(i)
 }
 
+// KillPeer stops peer i's node
+// The store is left in place so RestartPeer can rebuild from persisted state
+// Connection state is preserved so the peer is reachable on restart unless Disconnect was called separately
+func (c *Cluster) KillPeer(i int) {
+	if c.nodes[i] != nil {
+		c.nodes[i].Kill()
+		c.nodes[i] = nil
+	}
+}
+
+// RestartPeer rebuilds peer i from its persisted store
+// In-memory state (commitIndex, lastApplied, votedFor resets) is discarded
+// currentTerm, votedFor, and the log are rehydrated from the store
+func (c *Cluster) RestartPeer(i int) {
+	if c.nodes[i] != nil {
+		c.nodes[i].Kill()
+	}
+	node, err := consensus.Make(c.mesh.Peers(i), i, c.stores[i], c.applyChs[i])
+	if err != nil {
+		c.t.Fatalf("consensus.Make peer %d on restart: %v", i, err)
+	}
+	c.nodes[i] = node
+	if err := c.mesh.Register(i, node); err != nil {
+		c.t.Fatalf("mesh.Register peer %d on restart: %v", i, err)
+	}
+}
+
+// KillAll stops every peer without touching stores or connection state
+func (c *Cluster) KillAll() {
+	for i := range c.n {
+		c.KillPeer(i)
+	}
+}
+
+// RestartAll rebuilds every peer from its persisted store
+func (c *Cluster) RestartAll() {
+	for i := range c.n {
+		c.RestartPeer(i)
+	}
+}
+
+// IsRunning reports whether peer i currently has an active node
+func (c *Cluster) IsRunning(i int) bool { return c.nodes[i] != nil }
+
+// defaultDropRate is the per-call drop probability used by SetReliable(false)
+const defaultDropRate = 0.1
+
+// SetDropRate sets the mesh's per-call drop probability to rate (in [0, 1])
+// Use this when a test wants a drop rate other than the default
+func (c *Cluster) SetDropRate(rate float64) { c.mesh.SetDropRate(rate) }
+
+// SetReliable is a convenience wrapper around SetDropRate
+// reliable=true disables drops; reliable=false installs defaultDropRate
+func (c *Cluster) SetReliable(reliable bool) {
+	if reliable {
+		c.SetDropRate(0)
+	} else {
+		c.SetDropRate(defaultDropRate)
+	}
+}
+
 func (c *Cluster) isConnected(i int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.connected[i]
+}
+
+// isLive reports whether peer i is both running (not killed) and connected
+// Killed peers have c.nodes[i] == nil and must be skipped in leader/term checks
+func (c *Cluster) isLive(i int) bool {
+	return c.IsRunning(i) && c.isConnected(i)
 }
