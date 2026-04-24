@@ -3,6 +3,8 @@
 package testcluster
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"reflect"
 	"sort"
@@ -70,6 +72,9 @@ type Cluster struct {
 
 	// Count of One/StartOn invocations, printed in the Shutdown summary
 	opsCount atomic.Int64
+
+	// Snapshot interval in commits; 0 disables snapshotting entirely
+	snapshotInterval int
 }
 
 // N returns the cluster size
@@ -88,6 +93,15 @@ func WithApply(fn func(nodeIdx, index int, cmd any) any) Option {
 			c.appliedResults[i] = make(map[int]any)
 		}
 	}
+}
+
+// WithSnapshotInterval enables snapshotting every `interval` commits
+// After every `interval` applied entries, the harness encodes the applied
+// command map and calls Node.Snapshot to trim the log
+// Follower snapshots delivered via ApplyMsg.SnapshotValid are decoded and
+// rehydrated into appliedCommands so NCommitted queries stay consistent
+func WithSnapshotInterval(interval int) Option {
+	return func(c *Cluster) { c.snapshotInterval = interval }
 }
 
 // New builds and starts an n-node cluster and returns it
@@ -190,25 +204,95 @@ func formatByMethod(m map[string]int64) string {
 
 // trackApply drains peer i's apply channel and records committed commands
 // If WithApply is set, also feeds each command through applyFn
-// Snapshot messages are drained but not yet handled
+// If WithSnapshotInterval is set, triggers Node.Snapshot at the interval
+// and re-ingests SnapshotValid messages into appliedCommands
 func (c *Cluster) trackApply(i int) {
 	defer c.drainWG.Done()
 	for {
 		select {
 		case msg := <-c.applyChs[i]:
-			if msg.CommandValid {
+			switch {
+			case msg.CommandValid:
 				c.appliedMu.Lock()
 				c.appliedCommands[i][msg.CommandIndex] = msg.Command
 				if c.applyFn != nil {
 					c.appliedResults[i][msg.CommandIndex] = c.applyFn(i, msg.CommandIndex, msg.Command)
 				}
 				c.appliedMu.Unlock()
+				if c.snapshotInterval > 0 && (msg.CommandIndex+1)%c.snapshotInterval == 0 {
+					c.triggerSnapshot(i, msg.CommandIndex)
+				}
+			case msg.SnapshotValid && c.snapshotInterval > 0:
+				if err := c.ingestSnapshot(i, msg.Snapshot, msg.SnapshotIndex); err != nil {
+					c.t.Errorf("peer %d: ingest snapshot: %v", i, err)
+				}
 			}
-		// NOTE: ignore SnapshotValid messages for now
 		case <-c.done:
 			return
 		}
 	}
+}
+
+// triggerSnapshot encodes peer i's applied commands up to commandIndex
+// and asks Node.Snapshot to trim its log
+func (c *Cluster) triggerSnapshot(i, commandIndex int) {
+	data := c.encodeSnapshot(i, commandIndex)
+	if node := c.nodeAt(i); node != nil {
+		node.Snapshot(commandIndex, data)
+	}
+}
+
+// encodeSnapshot gob-encodes (lastIncludedIndex, []any{cmds 0..lastIncludedIndex})
+// from peer i's applied commands
+func (c *Cluster) encodeSnapshot(i, lastIncludedIndex int) []byte {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	xlog := make([]any, lastIncludedIndex+1)
+	for idx, cmd := range c.appliedCommands[i] {
+		if idx <= lastIncludedIndex {
+			xlog[idx] = cmd
+		}
+	}
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(lastIncludedIndex); err != nil {
+		c.t.Fatalf("encode snapshot index: %v", err)
+	}
+	if err := enc.Encode(xlog); err != nil {
+		c.t.Fatalf("encode snapshot log: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// ingestSnapshot decodes a snapshot produced by encodeSnapshot and replaces
+// peer i's applied commands with it
+// expectedIndex may be -1 to skip the cross-check used on restart
+func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
+	if len(data) == 0 {
+		return nil
+	}
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	var lastIncluded int
+	if err := dec.Decode(&lastIncluded); err != nil {
+		return fmt.Errorf("decode index: %w", err)
+	}
+	if expectedIndex != -1 && expectedIndex != lastIncluded {
+		return fmt.Errorf("snapshot lastIncluded=%d, expected=%d", lastIncluded, expectedIndex)
+	}
+	var xlog []any
+	if err := dec.Decode(&xlog); err != nil {
+		return fmt.Errorf("decode log: %w", err)
+	}
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	rebuilt := make(map[int]any, len(xlog))
+	for idx, cmd := range xlog {
+		if cmd != nil {
+			rebuilt[idx] = cmd
+		}
+	}
+	c.appliedCommands[i] = rebuilt
+	return nil
 }
 
 // Result returns the FSM output at (nodeIdx, index),
@@ -361,6 +445,19 @@ func (c *Cluster) RPCCount() int64 { return c.mesh.Stats().Calls }
 // BytesTotal returns cumulative gob-encoded bytes of RPC args + replies
 func (c *Cluster) BytesTotal() int64 { return c.mesh.Stats().Bytes }
 
+// MaxStateSize returns the largest persisted Raft state across all peers
+// Snapshot bytes are not counted — use this to verify snapshots effectively
+// cap log growth under WithSnapshotInterval
+func (c *Cluster) MaxStateSize() int {
+	max := 0
+	for _, s := range c.stores {
+		if sz := s.StateSize(); sz > max {
+			max = sz
+		}
+	}
+	return max
+}
+
 // Wait polls until expectedPeers have applied a command at index
 // Returns the committed value, or -1 if startTerm is passed and any peer advances beyond it
 // Fails the test if the index never reaches the expected peer count
@@ -512,6 +609,8 @@ func (c *Cluster) KillPeer(i int) {
 // RestartPeer rebuilds peer i from its persisted store
 // In-memory state (commitIndex, lastApplied, votedFor resets) is discarded
 // currentTerm, votedFor, and the log are rehydrated from the store
+// If snapshotting is enabled, the persisted snapshot is re-ingested so
+// appliedCommands stays consistent with the log's new base index
 func (c *Cluster) RestartPeer(i int) {
 	c.mu.Lock()
 	old := c.nodes[i]
@@ -519,6 +618,17 @@ func (c *Cluster) RestartPeer(i int) {
 	c.mu.Unlock()
 	if old != nil {
 		old.Kill()
+	}
+	if c.snapshotInterval > 0 {
+		snap, err := c.stores[i].ReadSnapshot()
+		if err != nil {
+			c.t.Fatalf("peer %d: read snapshot on restart: %v", i, err)
+		}
+		if len(snap) > 0 {
+			if err := c.ingestSnapshot(i, snap, -1); err != nil {
+				c.t.Fatalf("peer %d: ingest snapshot on restart: %v", i, err)
+			}
+		}
 	}
 	node, err := consensus.Make(c.mesh.Peers(i), i, c.stores[i], c.applyChs[i])
 	if err != nil {
