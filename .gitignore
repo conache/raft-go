@@ -16,3 +16,6 @@ venv/
 # OS droppings
 .DS_Store
 Thumbs.db
+
+# Debug artifacts (porcupine visualizations, etc.)
+debug/
