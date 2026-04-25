@@ -47,8 +47,10 @@ type Cluster struct {
 	stores []*memstorage.Store
 	// Per-peer Raft node, indexed by peer id
 	nodes []*consensus.Node
-	// Per-peer apply channel, drained by trackApply
+	// Per-peer apply channel, drained by trackApply for the life of the cluster
 	applyChs []chan consensus.ApplyMsg
+	// Per-peer last-applied index; lets trackApply drop stale or duplicate CVs
+	lastApplied []int
 	// Cluster boot time, used for the Shutdown summary line
 	startedAt time.Time
 
@@ -115,6 +117,7 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 		stores:          make([]*memstorage.Store, n),
 		nodes:           make([]*consensus.Node, n),
 		applyChs:        make([]chan consensus.ApplyMsg, n),
+		lastApplied:     make([]int, n),
 		connected:       make([]bool, n),
 		done:            make(chan struct{}),
 		startedAt:       time.Now(),
@@ -203,9 +206,11 @@ func formatByMethod(m map[string]int64) string {
 }
 
 // trackApply drains peer i's apply channel and records committed commands
-// If WithApply is set, also feeds each command through applyFn
-// If WithSnapshotInterval is set, triggers Node.Snapshot at the interval
-// and re-ingests SnapshotValid messages into appliedCommands
+// Out-of-order CVs are skipped (e.g. a stale slice racing a SnapshotValid
+// that already advanced lastApplied past it)
+// SnapshotValid rebuilds appliedCommands from the snapshot's xlog
+// WithApply runs applyFn on each accepted commit; WithSnapshotInterval
+// triggers Node.Snapshot at the configured cadence
 func (c *Cluster) trackApply(i int) {
 	defer c.drainWG.Done()
 	for {
@@ -214,10 +219,15 @@ func (c *Cluster) trackApply(i int) {
 			switch {
 			case msg.CommandValid:
 				c.appliedMu.Lock()
+				if msg.CommandIndex != c.lastApplied[i]+1 {
+					c.appliedMu.Unlock()
+					continue
+				}
 				c.appliedCommands[i][msg.CommandIndex] = msg.Command
 				if c.applyFn != nil {
 					c.appliedResults[i][msg.CommandIndex] = c.applyFn(i, msg.CommandIndex, msg.Command)
 				}
+				c.lastApplied[i] = msg.CommandIndex
 				c.appliedMu.Unlock()
 				if c.snapshotInterval > 0 && (msg.CommandIndex+1)%c.snapshotInterval == 0 {
 					c.triggerSnapshot(i, msg.CommandIndex)
@@ -292,6 +302,7 @@ func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
 		}
 	}
 	c.appliedCommands[i] = rebuilt
+	c.lastApplied[i] = lastIncluded
 	return nil
 }
 
@@ -593,9 +604,8 @@ func (c *Cluster) Connect(i int) {
 	c.mesh.Heal(i)
 }
 
-// KillPeer stops peer i's node
-// The store is left in place so RestartPeer can rebuild from persisted state
-// Connection state is preserved so the peer is reachable on restart unless Disconnect was called separately
+// KillPeer stops peer i's node; the store stays so RestartPeer can rebuild
+// Connection state is preserved across the kill
 func (c *Cluster) KillPeer(i int) {
 	c.mu.Lock()
 	n := c.nodes[i]
@@ -607,10 +617,10 @@ func (c *Cluster) KillPeer(i int) {
 }
 
 // RestartPeer rebuilds peer i from its persisted store
-// In-memory state (commitIndex, lastApplied, votedFor resets) is discarded
+// In-memory state (commitIndex, votedFor) is volatile and resets to zero
 // currentTerm, votedFor, and the log are rehydrated from the store
 // If snapshotting is enabled, the persisted snapshot is re-ingested so
-// appliedCommands stays consistent with the log's new base index
+// appliedCommands and lastApplied stay consistent with the log's new base
 func (c *Cluster) RestartPeer(i int) {
 	c.mu.Lock()
 	old := c.nodes[i]
@@ -619,6 +629,9 @@ func (c *Cluster) RestartPeer(i int) {
 	if old != nil {
 		old.Kill()
 	}
+	c.appliedMu.Lock()
+	c.lastApplied[i] = 0
+	c.appliedMu.Unlock()
 	if c.snapshotInterval > 0 {
 		snap, err := c.stores[i].ReadSnapshot()
 		if err != nil {

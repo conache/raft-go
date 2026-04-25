@@ -115,21 +115,12 @@ func TestSnapshotInstallOnReconnectUnreliable(t *testing.T) {
 
 // TestSnapshotInstallAfterCrash restarts the victim from its persisted
 // snapshot + log tail after each burst
-//
-// KNOWN ISSUE: reproduces a safety violation in the consensus impl — two
-// peers apply different commands at the same committed index when a peer
-// crashes during an active cluster and catches up via InstallSnapshot
-// The disconnect-based variant (TestSnapshotInstallOnReconnect) passes,
-// isolating the bug to the crash/restart path through InstallSnapshot
 func TestSnapshotInstallAfterCrash(t *testing.T) {
-	t.Skip("consensus bug: divergent commit after InstallSnapshot on a restarted peer — see elections/replication tests for background")
 	runSnapshotScenario(t, snapScenario{crash: true, reliable: true})
 }
 
 // TestSnapshotInstallAfterCrashUnreliable adds drops to InstallAfterCrash
-// Skipped for the same reason as TestSnapshotInstallAfterCrash
 func TestSnapshotInstallAfterCrashUnreliable(t *testing.T) {
-	t.Skip("consensus bug: divergent commit after InstallSnapshot on a restarted peer")
 	runSnapshotScenario(t, snapScenario{crash: true, reliable: false})
 }
 

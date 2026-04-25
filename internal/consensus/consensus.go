@@ -616,7 +616,7 @@ func (n *Node) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *trans
 	if args.LastIncludedIndex < n.commitIndex {
 		dlog.Dlog(
 			dlog.DDrop,
-			"S%d; T%d; R(%s) InstallSnapshot(): discarding request because LastIncludedIndex > commitIndex",
+			"S%d; T%d; R(%s) InstallSnapshot(): discarding request because LastIncludedIndex < commitIndex",
 			n.me,
 			n.currentTerm,
 			n.currentRole,
@@ -653,17 +653,26 @@ func (n *Node) InstallSnapshot(args *transport.InstallSnapshotArgs, reply *trans
 		return
 	}
 
+	// keep entries past LastIncludedIndex if the term at that index matches
+	// otherwise the local log diverges
+	// before the snapshot boundary and must be discarded entirely
+	localLast := args.LastIncludedIndex - n.snapshotLastIncludedIndex
+	if localLast >= 0 && localLast < len(n.log) && n.log[localLast].Term == args.LastIncludedTerm {
+		n.log = append([]transport.LogEntry{{Term: args.LastIncludedTerm}}, n.log[localLast+1:]...)
+	} else {
+		n.log = []transport.LogEntry{{Term: args.LastIncludedTerm}}
+	}
 	n.snapshotLastIncludedIndex = args.LastIncludedIndex
 	n.snapshotLastIncludedTerm = args.LastIncludedTerm
 	n.snapshot = args.Data
-	n.log = []transport.LogEntry{{Term: args.LastIncludedTerm}}
 	dlog.Dlog(
 		dlog.DSnap,
-		"S%d; T%d; R(%s) - InstallSnapshot() - log updated to only include dummy for SnapshotIndex='%d'(global)",
+		"S%d; T%d; R(%s) - InstallSnapshot() - log trimmed to snapshot boundary %d; remaining entries=%d",
 		n.me,
 		n.currentTerm,
 		n.currentRole,
 		args.LastIncludedIndex,
+		len(n.log)-1,
 	)
 
 	// persist the node's state updates
@@ -834,10 +843,12 @@ func (n *Node) applyLogEntriesToState(
 // update commit index
 // and apply newly committed entries to the node's state
 func (n *Node) monitorAndUpdateState() {
-	dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - monitorAndUpdateState", n.me, n.currentTerm, n.currentRole)
-	// take the lock to correctly initialize the latest applied commit index
 	n.mu.Lock()
-	previousCommitIndex := n.commitIndex
+	dlog.Dlog(dlog.DWarn, "S%d; T%d; R(%s) - monitorAndUpdateState", n.me, n.currentTerm, n.currentRole)
+	// Important: set the applier cursor at the snapshot boundary, not commitIndex
+	// otherwise, an AppendEntries handler can bump commitIndex before this goroutine is scheduled,
+	// which would silently skip entries past snapshotLastIncludedIndex
+	previousCommitIndex := n.snapshotLastIncludedIndex
 	n.mu.Unlock()
 
 	for !n.killed() {
@@ -1030,11 +1041,10 @@ func (n *Node) appendEntriesOnPeer(
 				continue
 			} else {
 				// update matchIndex and nextIndex
-				// we want to use max() here, because these vaules can be
-				// also updated from other replicateEntries goroutines that
-				// could've come AFTER this current replicateEntries execution
-				n.nextIndex[peerIdx] = installSnapshotReq.LastIncludedIndex + 1
-				n.matchIndex[peerIdx] = installSnapshotReq.LastIncludedIndex
+				// max() guards against regressing values that a concurrent
+				// goroutine has already advanced past this snapshot
+				n.nextIndex[peerIdx] = max(installSnapshotReq.LastIncludedIndex+1, n.nextIndex[peerIdx])
+				n.matchIndex[peerIdx] = max(installSnapshotReq.LastIncludedIndex, n.matchIndex[peerIdx])
 
 				// match index and  index updated
 				// for performance reasons, we can check here if the commit index of the leader changed
@@ -1055,30 +1065,12 @@ func (n *Node) appendEntriesOnPeer(
 					go n.sendHeartbeat()
 				}
 
-				if len(logCopy) == 1 {
-					// the node has only the dummy snapshot entry in the log, so we don't need to send
-					// any remaining log entries
-					operationFinished = true
-					n.mu.Unlock()
-					continue
-				}
-
-				// update nextIndex copy for the next iteration
-				nextIndexCopy[peerIdx] = 1
-				prevLogTerm = installSnapshotReq.LastIncludedTerm
-				prevLogIndex = installSnapshotReq.LastIncludedIndex
-				prevLogIndexNorm = n.nextIndex[peerIdx] - installSnapshotReq.LastIncludedIndex - 1
-				dlog.Dlog(
-					dlog.DSnap,
-					"S%d; T%d; R(%s) - InstallSnapshot: sending the remaining log entries to S%d: prevLogIndexNorm - '%d'; prevLogTerm - '%d'",
-					n.me,
-					installSnapshotReq.Term,
-					n.currentRole,
-					peerIdx,
-					prevLogIndexNorm,
-					prevLogTerm,
-				)
+				// InstallSnapshot finished, continue executing entries replication
+				// with a fresh parameter set
+				operationFinished = true
 				n.mu.Unlock()
+				go n.replicateEntries()
+				continue
 			}
 		}
 
@@ -1140,7 +1132,7 @@ func (n *Node) appendEntriesOnPeer(
 				maxReplicatedEntryIndex := prevLogIndex + len(entriesSlice)
 				peerNextIndex := maxReplicatedEntryIndex + 1
 				n.nextIndex[peerIdx] = max(peerNextIndex, n.nextIndex[peerIdx])
-				n.matchIndex[peerIdx] = maxReplicatedEntryIndex
+				n.matchIndex[peerIdx] = max(maxReplicatedEntryIndex, n.matchIndex[peerIdx])
 
 				// match index and  index updated
 				// for performance reasons, we can check here if the commit index of the leader changed
