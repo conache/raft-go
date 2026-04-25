@@ -155,6 +155,7 @@ func TestFigure8Reliable(t *testing.T) {
 
 	nup := servers
 	for range iters {
+		// Find the current leader by trying StartOn on every running peer
 		leader := -1
 		for i := range servers {
 			if !c.IsRunning(i) {
@@ -172,6 +173,7 @@ func TestFigure8Reliable(t *testing.T) {
 			time.Sleep(time.Duration(rand.Int63n(13)) * time.Millisecond)
 		}
 
+		// Kill the freshly-found leader to force a re-election next iteration
 		if leader != -1 {
 			c.KillPeer(leader)
 			nup--
@@ -299,6 +301,7 @@ func churn(t *testing.T, reliable bool) {
 	defer c.Shutdown()
 	c.SetReliable(reliable)
 
+	// Spawn client goroutines; each runs until stop is set
 	var stop atomic.Bool
 	results := make([]chan []int, clients)
 	for i := range clients {
@@ -306,6 +309,7 @@ func churn(t *testing.T, reliable bool) {
 		go churnClient(t, c, i, servers, &stop, results[i])
 	}
 
+	// Random churn: disconnect / restart / kill peers between sleeps
 	for range iters {
 		if rand.Intn(1000) < 200 {
 			c.Disconnect(rand.Intn(servers))
@@ -329,6 +333,7 @@ func churn(t *testing.T, reliable bool) {
 		time.Sleep((electionTimeout * 7) / 10)
 	}
 
+	// Restore reliability and bring every peer back up
 	time.Sleep(electionTimeout)
 	c.SetReliable(true)
 	for i := range servers {
@@ -338,6 +343,7 @@ func churn(t *testing.T, reliable bool) {
 		c.Connect(i)
 	}
 
+	// Stop the clients and gather their observed-committed values
 	stop.Store(true)
 
 	values := []int{}
@@ -349,6 +355,8 @@ func churn(t *testing.T, reliable bool) {
 		values = append(values, vv...)
 	}
 
+	// Trigger one final commit and replay every index to build the canonical
+	// committed log, then check every value clients observed is in it
 	time.Sleep(electionTimeout)
 	lastIndex := c.One(rand.Int(), servers, true)
 
@@ -362,7 +370,6 @@ func churn(t *testing.T, reliable bool) {
 		committed = append(committed, vi)
 	}
 
-	// Every value a client observed must still be in the final committed log
 	for _, v := range values {
 		if !slices.Contains(committed, v) {
 			t.Fatalf("client-observed value %d is missing from the committed log", v)
@@ -377,6 +384,7 @@ func churnClient(t *testing.T, c *testcluster.Cluster, me, servers int, stop *at
 	defer func() { out <- values }()
 
 	for !stop.Load() {
+		// Try to propose on every peer; remember the index any leader accepted
 		x := rand.Int()
 		index := -1
 		ok := false

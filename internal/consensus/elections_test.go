@@ -53,8 +53,9 @@ func TestElectionReelectsAfterLeaderDisconnect(t *testing.T) {
 		t.Fatalf("new leader (%d) should differ from the disconnected one (%d)", leader2, leader1)
 	}
 
-	// Rejoin the old leader. The cluster should still have exactly one leader;
-	// the reconnected peer must demote on seeing the higher term.
+	// Rejoin the old leader.
+	// The cluster should still have exactly one leader; the reconnected
+	// peer must demote on seeing the higher term.
 	c.Connect(leader1)
 	c.CheckOneLeader()
 }
@@ -65,10 +66,11 @@ func TestElectionReelectsAfterLeaderDisconnect(t *testing.T) {
 //
 // A 5-peer cluster is used instead of 3 so that disconnecting 3 peers
 // leaves only 2 connected — which is never a majority of 5 (quorum is 3),
-// regardless of how elections race with the Disconnect calls. A 3-peer
-// cluster here is racy: the window between the two required Disconnects
-// is wide enough for a candidate to win 2 of 3 votes before the leader is
-// isolated, producing a spurious leader that CheckNoLeader then catches.
+// regardless of how elections race with the Disconnect calls.
+// A 3-peer cluster here is racy: the window between the two required
+// Disconnects is wide enough for a candidate to win 2 of 3 votes before
+// the leader is isolated, producing a spurious leader that CheckNoLeader
+// then catches.
 func TestElectionStallsWithoutQuorum(t *testing.T) {
 	const servers = 5
 	c := testcluster.New(t, servers)
@@ -77,8 +79,9 @@ func TestElectionStallsWithoutQuorum(t *testing.T) {
 	leader1 := c.CheckOneLeader()
 
 	// Disconnect three peers including the leader — only 2 remain, below
-	// quorum. Disconnect non-leaders first so any election racing with this
-	// sequence still has the leader available to reject stale requests.
+	// quorum.
+	// Disconnect non-leaders first so any election racing with this sequence
+	// still has the leader available to reject stale requests.
 	others := []int{(leader1 + 1) % servers, (leader1 + 2) % servers}
 	for _, o := range others {
 		c.Disconnect(o)
@@ -115,8 +118,9 @@ func TestElectionOldLeaderDemotesAfterRejoin(t *testing.T) {
 		t.Fatalf("new leader should differ from the disconnected one")
 	}
 
-	// Rejoin the old leader. The new leader's heartbeat (100 ms interval)
-	// carries the higher term; the rejoined peer must demote on receiving it.
+	// Rejoin the old leader.
+	// The new leader's heartbeat (100 ms interval) carries the higher term;
+	// the rejoined peer must demote on receiving it.
 	c.Connect(leader1)
 	time.Sleep(200 * time.Millisecond)
 
@@ -153,8 +157,9 @@ func TestElectionEndToEndRecovery(t *testing.T) {
 	leader2 := c.CheckOneLeader()
 
 	// Take 3 peers offline including the current leader — only 2 remain,
-	// below quorum of 5. Disconnect non-leaders first to keep the
-	// sequential-Disconnect window safe.
+	// below quorum of 5.
+	// Disconnect non-leaders first to keep the sequential-Disconnect window
+	// safe.
 	others := []int{(leader2 + 1) % servers, (leader2 + 2) % servers}
 	for _, o := range others {
 		c.Disconnect(o)

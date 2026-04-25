@@ -1,8 +1,8 @@
-// Package lincheck provides linearizability-testing helpers built on top of
-// github.com/anishathalye/porcupine. It owns the reusable infrastructure
-// for recording client operations against the raft cluster, feeding the
-// resulting history to Porcupine, and optionally emitting an HTML
-// visualization when a test fails.
+// Package lincheck provides linearizability-testing helpers built on top
+// of github.com/anishathalye/porcupine.
+// It owns the reusable infrastructure for recording client operations
+// against the raft cluster, feeding the resulting history to Porcupine,
+// and optionally emitting an HTML visualization when a test fails.
 //
 // Typical usage:
 //

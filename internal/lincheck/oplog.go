@@ -55,6 +55,7 @@ func (l *OpLog) Op(clientID int, input any, fn func() any) {
 	start := nowMonotonic()
 	output := fn()
 	end := nowMonotonic()
+
 	l.Append(porcupine.Operation{
 		ClientId: clientID,
 		Input:    input,

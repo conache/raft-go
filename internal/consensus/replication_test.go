@@ -39,8 +39,9 @@ func TestReplicationBasicAgreement(t *testing.T) {
 
 // TestReplicationRegisterLinearizable runs three concurrent client
 // goroutines against a 3-node cluster, each issuing 20 mixed Put/Get
-// operations on a shared single-register state machine. The resulting
-// history is fed to Porcupine, which verifies it is linearizable.
+// operations on a shared single-register state machine.
+// The resulting history is fed to Porcupine, which verifies it is
+// linearizable.
 func TestReplicationRegisterLinearizable(t *testing.T) {
 	const (
 		peers        = 3
@@ -50,8 +51,9 @@ func TestReplicationRegisterLinearizable(t *testing.T) {
 	)
 
 	// Per-node register FSMs, allocated up front so the apply hook can
-	// route each node's commits to its own FSM. Raft delivers applies in
-	// log order, so the per-node FSMs converge to the same sequence.
+	// route each node's commits to its own FSM.
+	// Raft delivers applies in log order, so the per-node FSMs converge to
+	// the same sequence.
 	fsms := make([]*lincheck.RegisterFSM, peers)
 	for i := range fsms {
 		fsms[i] = lincheck.NewRegisterFSM()
@@ -146,15 +148,17 @@ func TestReplicationFollowerFailure(t *testing.T) {
 
 	c.One(101, servers, false)
 
-	// Disconnect one follower. Leader + remaining follower = 2/3 quorum,
-	// so new proposals must still commit at N-1 peers.
+	// Disconnect one follower.
+	// Leader + remaining follower = 2/3 quorum, so new proposals must still
+	// commit at N-1 peers.
 	leader1 := c.CheckOneLeader()
 	c.Disconnect((leader1 + 1) % servers)
 
 	c.One(102, servers-1, false)
 	c.One(103, servers-1, false)
 
-	// Disconnect the remaining follower. The leader is now alone.
+	// Disconnect the remaining follower.
+	// The leader is now alone.
 	leader2 := c.CheckOneLeader()
 	c.Disconnect((leader2 + 1) % servers)
 	c.Disconnect((leader2 + 2) % servers)
@@ -191,7 +195,8 @@ func TestReplicationLeaderFailure(t *testing.T) {
 	c.One(102, servers-1, false)
 	c.One(103, servers-1, false)
 
-	// Disconnect the new leader too. No peer can commit anything now.
+	// Disconnect the new leader too.
+	// No peer can commit anything now.
 	leader2 := c.CheckOneLeader()
 	c.Disconnect(leader2)
 
@@ -225,8 +230,9 @@ func TestReplicationFailAgree(t *testing.T) {
 	c.One(104, servers-1, false)
 	c.One(105, servers-1, false)
 
-	// Rejoin the follower. The cluster must still be able to commit, and
-	// the follower must catch up so new proposals commit at all servers
+	// Rejoin the follower.
+	// The cluster must still be able to commit, and the follower must catch
+	// up so new proposals commit at all servers
 	c.Connect(follower)
 	time.Sleep(electionTimeout)
 	c.One(106, servers, true)
@@ -357,7 +363,8 @@ func termAdvanced(c *testcluster.Cluster, startTerm int) bool {
 }
 
 // collectCommitted drains indices, waiting for each to commit at startTerm
-// on all peers. If term advances mid-wait, returns termChanged=true.
+// on all peers.
+// If term advances mid-wait, returns termChanged=true.
 func collectCommitted(c *testcluster.Cluster, indices <-chan int, startTerm int) (values []int, termChanged bool) {
 	for idx := range indices {
 		cmd := c.Wait(idx, c.N(), startTerm)
@@ -388,8 +395,8 @@ func TestReplicationRejoinPartitionedLeader(t *testing.T) {
 
 	c.One(101, servers, true)
 
-	// Partition the leader. It'll keep accepting Start()s locally but
-	// can't commit them.
+	// Partition the leader.
+	// It'll keep accepting Start()s locally but can't commit them.
 	leader1 := c.CheckOneLeader()
 	c.Disconnect(leader1)
 
@@ -409,7 +416,8 @@ func TestReplicationRejoinPartitionedLeader(t *testing.T) {
 
 	c.One(104, 2, true)
 
-	// Everyone back in. Final commit must reach all three peers.
+	// Everyone back in.
+	// Final commit must reach all three peers.
 	c.Connect(leader2)
 	c.One(105, servers, true)
 }

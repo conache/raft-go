@@ -44,6 +44,7 @@ func NewRegisterFSM() *RegisterFSM { return &RegisterFSM{} }
 func (s *RegisterFSM) Apply(op RegOp) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	switch op.Kind {
 	case RegOpPut:
 		s.val = op.Value

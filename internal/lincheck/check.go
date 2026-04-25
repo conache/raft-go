@@ -44,18 +44,22 @@ func writeVisualization(model porcupine.Model, info porcupine.LinearizationInfo,
 	if err != nil {
 		return "", err
 	}
+
 	dir := filepath.Join(root, visDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+
 	// Format: 20260424-141523.847_TestName.html, sortable by ls/time
 	stamp := time.Now().Format("20060102-150405.000")
 	path := filepath.Join(dir, fmt.Sprintf("%s_%s.html", stamp, sanitizeName(name)))
+
 	f, err := os.Create(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+
 	if err := porcupine.Visualize(model, info, f); err != nil {
 		return "", err
 	}
@@ -68,6 +72,7 @@ func repoRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 			return dir, nil

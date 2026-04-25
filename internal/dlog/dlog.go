@@ -9,8 +9,8 @@ import (
 
 var debugStart time.Time
 
-// Debug controls whether Dlog / DPrintf emit output. Set DEBUG_TRACE=1 in
-// the environment to enable.
+// Debug controls whether Dlog / DPrintf emit output.
+// Set DEBUG_TRACE=1 in the environment to enable.
 var Debug = os.Getenv("DEBUG_TRACE") == "1"
 
 type LogTopic string
@@ -44,7 +44,7 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func Dlog(topic LogTopic, format string, a ...interface{}) {
+func Dlog(topic LogTopic, format string, a ...any) {
 	if !Debug {
 		return
 	}
@@ -55,7 +55,7 @@ func Dlog(topic LogTopic, format string, a ...interface{}) {
 	DPrintf(format, a...)
 }
 
-func DPrintf(format string, a ...interface{}) {
+func DPrintf(format string, a ...any) {
 	if Debug {
 		log.Printf(format, a...)
 	}
