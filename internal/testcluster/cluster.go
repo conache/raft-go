@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/conache/raft-go/internal/consensus"
+	"github.com/conache/raft-go/storage"
 	memstorage "github.com/conache/raft-go/storage/memory"
+	"github.com/conache/raft-go/transport"
 	memtransport "github.com/conache/raft-go/transport/memory"
 )
 
@@ -77,7 +79,14 @@ type Cluster struct {
 
 	// Snapshot interval in commits; 0 disables snapshotting entirely
 	snapshotInterval int
+
+	// Optional caller-supplied node constructor
+	nodeFactory NodeFactory
+	// Per-peer kill function returned by nodeFactory, indexed by peer id
+	killFns []func()
 }
+
+type NodeFactory func(idx int, peers []transport.Peer, store storage.Store) (*consensus.Node, func())
 
 // N returns the cluster size
 func (c *Cluster) N() int { return c.n }
@@ -85,12 +94,20 @@ func (c *Cluster) N() int { return c.n }
 // Option configures a Cluster at construction
 type Option func(*Cluster)
 
+// WithNodeFactory installs a custom node constructor
+// Use this when the caller (e.g. an RSM-level test harness) needs to own
+// the apply channel and applier goroutine itself.
+func WithNodeFactory(f NodeFactory) Option {
+	return func(c *Cluster) { c.nodeFactory = f }
+}
+
 // WithApply runs fn on every committed command and stores the result
 // Retrievable via Result / AnyResult; nodes are distinguished by nodeIdx
 func WithApply(fn func(nodeIdx, index int, cmd any) any) Option {
 	return func(c *Cluster) {
 		c.applyFn = fn
 		c.appliedResults = make([]map[int]any, c.n)
+
 		for i := range c.n {
 			c.appliedResults[i] = make(map[int]any)
 		}
@@ -110,6 +127,7 @@ func WithSnapshotInterval(interval int) Option {
 // Caller must defer Shutdown
 func New(t *testing.T, n int, opts ...Option) *Cluster {
 	t.Helper()
+
 	c := &Cluster{
 		t:               t,
 		n:               n,
@@ -118,6 +136,7 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 		nodes:           make([]*consensus.Node, n),
 		applyChs:        make([]chan consensus.ApplyMsg, n),
 		lastApplied:     make([]int, n),
+		killFns:         make([]func(), n),
 		connected:       make([]bool, n),
 		done:            make(chan struct{}),
 		startedAt:       time.Now(),
@@ -136,22 +155,35 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 	// an RPC to an unregistered target before the setup completes
 	for i := range n {
 		c.stores[i] = memstorage.New()
+
+		if c.nodeFactory != nil {
+			node, killFn := c.nodeFactory(i, c.mesh.Peers(i), c.stores[i])
+			c.nodes[i] = node
+			c.killFns[i] = killFn
+			c.connected[i] = true
+			continue
+		}
+
 		c.applyChs[i] = make(chan consensus.ApplyMsg, 256)
+
 		node, err := consensus.Make(c.mesh.Peers(i), i, c.stores[i], c.applyChs[i])
 		if err != nil {
 			t.Fatalf("consensus.Make peer %d: %v", i, err)
 		}
+
 		c.nodes[i] = node
 		c.connected[i] = true
 
 		c.drainWG.Add(1)
 		go c.trackApply(i)
 	}
+
 	for i := range n {
 		if err := c.mesh.Register(i, c.nodes[i]); err != nil {
 			t.Fatalf("mesh.Register peer %d: %v", i, err)
 		}
 	}
+
 	return c
 }
 
@@ -160,18 +192,26 @@ func New(t *testing.T, n int, opts ...Option) *Cluster {
 func (c *Cluster) Shutdown() {
 	elapsed := time.Since(c.startedAt)
 	close(c.done)
+
 	for i := range c.n {
-		if c.nodes[i] != nil {
+		switch {
+		case c.killFns[i] != nil:
+			c.killFns[i]()
+		case c.nodes[i] != nil:
 			c.nodes[i].Kill()
 		}
 	}
+
+	// wait for all pending trackApply goroutines
 	c.drainWG.Wait()
 
 	s := c.mesh.Stats()
+
 	status := "PASSED"
 	if c.t.Failed() {
 		status = "FAILED"
 	}
+
 	fmt.Printf(
 		"[%s] time=%s #peers=%d #RPCs=%d [%s] #dropped=%d #Ops=%d\n\n",
 		status,
@@ -190,11 +230,13 @@ func formatByMethod(m map[string]int64) string {
 	if len(m) == 0 {
 		return ""
 	}
+
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
 	var sb strings.Builder
 	for i, k := range keys {
 		if i > 0 {
@@ -202,6 +244,7 @@ func formatByMethod(m map[string]int64) string {
 		}
 		fmt.Fprintf(&sb, "%s=%d", k, m[k])
 	}
+
 	return sb.String()
 }
 
@@ -213,6 +256,7 @@ func formatByMethod(m map[string]int64) string {
 // triggers Node.Snapshot at the configured cadence
 func (c *Cluster) trackApply(i int) {
 	defer c.drainWG.Done()
+
 	for {
 		select {
 		case msg := <-c.applyChs[i]:
@@ -223,20 +267,24 @@ func (c *Cluster) trackApply(i int) {
 					c.appliedMu.Unlock()
 					continue
 				}
+
 				c.appliedCommands[i][msg.CommandIndex] = msg.Command
 				if c.applyFn != nil {
 					c.appliedResults[i][msg.CommandIndex] = c.applyFn(i, msg.CommandIndex, msg.Command)
 				}
 				c.lastApplied[i] = msg.CommandIndex
 				c.appliedMu.Unlock()
+
 				if c.snapshotInterval > 0 && (msg.CommandIndex+1)%c.snapshotInterval == 0 {
 					c.triggerSnapshot(i, msg.CommandIndex)
 				}
+
 			case msg.SnapshotValid && c.snapshotInterval > 0:
 				if err := c.ingestSnapshot(i, msg.Snapshot, msg.SnapshotIndex); err != nil {
 					c.t.Errorf("peer %d: ingest snapshot: %v", i, err)
 				}
 			}
+
 		case <-c.done:
 			return
 		}
@@ -257,12 +305,14 @@ func (c *Cluster) triggerSnapshot(i, commandIndex int) {
 func (c *Cluster) encodeSnapshot(i, lastIncludedIndex int) []byte {
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
+
 	xlog := make([]any, lastIncludedIndex+1)
 	for idx, cmd := range c.appliedCommands[i] {
 		if idx <= lastIncludedIndex {
 			xlog[idx] = cmd
 		}
 	}
+
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(lastIncludedIndex); err != nil {
@@ -271,6 +321,7 @@ func (c *Cluster) encodeSnapshot(i, lastIncludedIndex int) []byte {
 	if err := enc.Encode(xlog); err != nil {
 		c.t.Fatalf("encode snapshot log: %v", err)
 	}
+
 	return buf.Bytes()
 }
 
@@ -281,7 +332,9 @@ func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
 	if len(data) == 0 {
 		return nil
 	}
+
 	dec := gob.NewDecoder(bytes.NewReader(data))
+
 	var lastIncluded int
 	if err := dec.Decode(&lastIncluded); err != nil {
 		return fmt.Errorf("decode index: %w", err)
@@ -289,12 +342,15 @@ func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
 	if expectedIndex != -1 && expectedIndex != lastIncluded {
 		return fmt.Errorf("snapshot lastIncluded=%d, expected=%d", lastIncluded, expectedIndex)
 	}
+
 	var xlog []any
 	if err := dec.Decode(&xlog); err != nil {
 		return fmt.Errorf("decode log: %w", err)
 	}
+
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
+
 	rebuilt := make(map[int]any, len(xlog))
 	for idx, cmd := range xlog {
 		if cmd != nil {
@@ -303,6 +359,7 @@ func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
 	}
 	c.appliedCommands[i] = rebuilt
 	c.lastApplied[i] = lastIncluded
+
 	return nil
 }
 
@@ -311,9 +368,11 @@ func (c *Cluster) ingestSnapshot(i int, data []byte, expectedIndex int) error {
 func (c *Cluster) Result(nodeIdx, index int) (any, bool) {
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
+
 	if c.appliedResults == nil {
 		return nil, false
 	}
+
 	r, ok := c.appliedResults[nodeIdx][index]
 	return r, ok
 }
@@ -323,9 +382,11 @@ func (c *Cluster) Result(nodeIdx, index int) (any, bool) {
 func (c *Cluster) AnyResult(index int) (any, bool) {
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
+
 	if c.appliedResults == nil {
 		return nil, false
 	}
+
 	for i := range c.n {
 		if r, ok := c.appliedResults[i][index]; ok {
 			return r, true
@@ -339,6 +400,7 @@ func (c *Cluster) AnyResult(index int) (any, bool) {
 // Returns the leader's peer id; fails the test if no leader emerges
 func (c *Cluster) CheckOneLeader() int {
 	c.t.Helper()
+
 	for range checkLeaderRetries {
 		time.Sleep(checkLeaderInterval)
 
@@ -360,6 +422,7 @@ func (c *Cluster) CheckOneLeader() int {
 				highestTerm = term
 			}
 		}
+
 		if highestTerm >= 0 {
 			leaders := leadersByTerm[highestTerm]
 			if len(leaders) > 1 {
@@ -368,6 +431,7 @@ func (c *Cluster) CheckOneLeader() int {
 			return leaders[0]
 		}
 	}
+
 	c.t.Fatalf("expected one leader, got none")
 	return -1
 }
@@ -375,6 +439,7 @@ func (c *Cluster) CheckOneLeader() int {
 // CheckNoLeader fails the test if any live peer claims leadership
 func (c *Cluster) CheckNoLeader() {
 	c.t.Helper()
+
 	for i := range c.n {
 		node, live := c.liveNode(i)
 		if !live {
@@ -391,6 +456,7 @@ func (c *Cluster) CheckNoLeader() {
 // Disagreement is often transient (heartbeat hasn't reached a rejoined peer yet)
 func (c *Cluster) CheckTerms() int {
 	c.t.Helper()
+
 	var lastSeen []int
 	for range checkLeaderRetries {
 		terms := c.connectedTerms()
@@ -400,6 +466,7 @@ func (c *Cluster) CheckTerms() int {
 		lastSeen = terms
 		time.Sleep(checkLeaderInterval)
 	}
+
 	c.t.Fatalf("peers never agreed on term (last seen: %v)", lastSeen)
 	return -1
 }
@@ -433,6 +500,7 @@ func allEqual(xs []int) bool {
 // Returns Start's (index, term, isLeader) verbatim, or zero values if i is currently killed
 func (c *Cluster) StartOn(i int, cmd any) (index, term int, isLeader bool) {
 	c.opsCount.Add(1)
+
 	n := c.nodeAt(i)
 	if n == nil {
 		return 0, 0, false
@@ -474,16 +542,19 @@ func (c *Cluster) MaxStateSize() int {
 // Fails the test if the index never reaches the expected peer count
 func (c *Cluster) Wait(index, expectedPeers, startTerm int) any {
 	c.t.Helper()
+
 	to := 10 * time.Millisecond
 	for range 30 {
 		n, _ := c.NCommitted(index)
 		if n >= expectedPeers {
 			break
 		}
+
 		time.Sleep(to)
 		if to < time.Second {
 			to *= 2
 		}
+
 		if startTerm >= 0 {
 			for i := range c.n {
 				if c.Term(i) > startTerm {
@@ -492,6 +563,7 @@ func (c *Cluster) Wait(index, expectedPeers, startTerm int) any {
 			}
 		}
 	}
+
 	n, cmd := c.NCommitted(index)
 	if n < expectedPeers {
 		c.t.Fatalf("Wait: only %d peers committed index %d, want %d", n, index, expectedPeers)
@@ -502,6 +574,7 @@ func (c *Cluster) Wait(index, expectedPeers, startTerm int) any {
 // CheckNoAgreement fails the test if any peer has committed at the given index
 func (c *Cluster) CheckNoAgreement(index int) {
 	c.t.Helper()
+
 	n, _ := c.NCommitted(index)
 	if n > 0 {
 		c.t.Fatalf("%d peer(s) committed at index %d, expected none", n, index)
@@ -511,12 +584,14 @@ func (c *Cluster) CheckNoAgreement(index int) {
 // NCommitted returns how many peers applied index, and the command value
 func (c *Cluster) NCommitted(index int) (int, any) {
 	c.t.Helper()
+
 	c.appliedMu.Lock()
 	defer c.appliedMu.Unlock()
 
 	count := 0
 	var committed any
 	sawValue := false
+
 	for i := range c.n {
 		cmd, ok := c.appliedCommands[i][index]
 		if !ok {
@@ -532,6 +607,7 @@ func (c *Cluster) NCommitted(index int) (int, any) {
 		sawValue = true
 		count++
 	}
+
 	return count, committed
 }
 
@@ -562,6 +638,7 @@ func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
 			}
 			time.Sleep(onePollInterval)
 		}
+
 		if !retry {
 			c.t.Fatalf(
 				"One: commit of %v never reached %d peers at idx %d",
@@ -569,6 +646,7 @@ func (c *Cluster) One(cmd any, expectedPeers int, retry bool) int {
 			)
 		}
 	}
+
 	c.t.Fatalf("One: deadline exceeded for cmd %v", cmd)
 	return -1
 }
@@ -593,6 +671,7 @@ func (c *Cluster) Disconnect(i int) {
 	c.mu.Lock()
 	c.connected[i] = false
 	c.mu.Unlock()
+
 	c.mesh.Isolate(i)
 }
 
@@ -601,7 +680,37 @@ func (c *Cluster) Connect(i int) {
 	c.mu.Lock()
 	c.connected[i] = true
 	c.mu.Unlock()
+
 	c.mesh.Heal(i)
+}
+
+// IsConnected reports whether peer i is currently connected
+func (c *Cluster) IsConnected(i int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected[i]
+}
+
+// Partition installs a two-way split: pairs across (p1, p2) are
+// disconnected; pairs within each side are connected.
+// p1 ∪ p2 must cover [0, n) and not overlap.
+// Useful for tests that need a leader to remain online but unreachable
+// from a majority of peers
+func (c *Cluster) Partition(p1, p2 []int) {
+	side1 := make(map[int]bool, len(p1))
+	for _, i := range p1 {
+		side1[i] = true
+	}
+
+	for i := range c.n {
+		for j := i + 1; j < c.n; j++ {
+			if side1[i] != side1[j] {
+				c.mesh.Disconnect(i, j)
+			} else {
+				c.mesh.Connect(i, j)
+			}
+		}
+	}
 }
 
 // KillPeer stops peer i's node; the store stays so RestartPeer can rebuild
@@ -609,9 +718,15 @@ func (c *Cluster) Connect(i int) {
 func (c *Cluster) KillPeer(i int) {
 	c.mu.Lock()
 	n := c.nodes[i]
+	killFn := c.killFns[i]
 	c.nodes[i] = nil
+	c.killFns[i] = nil
 	c.mu.Unlock()
-	if n != nil {
+
+	switch {
+	case killFn != nil:
+		killFn()
+	case n != nil:
 		n.Kill()
 	}
 }
@@ -624,15 +739,25 @@ func (c *Cluster) KillPeer(i int) {
 func (c *Cluster) RestartPeer(i int) {
 	c.mu.Lock()
 	old := c.nodes[i]
+	oldKill := c.killFns[i]
 	c.nodes[i] = nil
+	c.killFns[i] = nil
 	c.mu.Unlock()
-	if old != nil {
+
+	switch {
+	case oldKill != nil:
+		oldKill()
+	case old != nil:
 		old.Kill()
 	}
-	c.appliedMu.Lock()
-	c.lastApplied[i] = 0
-	c.appliedMu.Unlock()
-	if c.snapshotInterval > 0 {
+
+	if c.nodeFactory == nil {
+		c.appliedMu.Lock()
+		c.lastApplied[i] = 0
+		c.appliedMu.Unlock()
+	}
+
+	if c.nodeFactory == nil && c.snapshotInterval > 0 {
 		snap, err := c.stores[i].ReadSnapshot()
 		if err != nil {
 			c.t.Fatalf("peer %d: read snapshot on restart: %v", i, err)
@@ -643,15 +768,27 @@ func (c *Cluster) RestartPeer(i int) {
 			}
 		}
 	}
-	node, err := consensus.Make(c.mesh.Peers(i), i, c.stores[i], c.applyChs[i])
-	if err != nil {
-		c.t.Fatalf("consensus.Make peer %d on restart: %v", i, err)
+
+	var node *consensus.Node
+	var killFn func()
+
+	if c.nodeFactory != nil {
+		node, killFn = c.nodeFactory(i, c.mesh.Peers(i), c.stores[i])
+	} else {
+		var err error
+		node, err = consensus.Make(c.mesh.Peers(i), i, c.stores[i], c.applyChs[i])
+		if err != nil {
+			c.t.Fatalf("consensus.Make peer %d on restart: %v", i, err)
+		}
 	}
+
 	if err := c.mesh.Register(i, node); err != nil {
 		c.t.Fatalf("mesh.Register peer %d on restart: %v", i, err)
 	}
+
 	c.mu.Lock()
 	c.nodes[i] = node
+	c.killFns[i] = killFn
 	c.mu.Unlock()
 }
 
@@ -700,6 +837,7 @@ func (c *Cluster) SetReliable(reliable bool) {
 func (c *Cluster) liveNode(i int) (*consensus.Node, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	n := c.nodes[i]
 	if n == nil || !c.connected[i] {
 		return nil, false
