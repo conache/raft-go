@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package raft.v1;
+
+option go_package = "github.com/conache/raft-go/transport/grpc/pb/raft/v1;raftpb";
+
+// RaftService carries the RPCs Raft peers exchange to elect leaders,
+// replicate the log, and ship snapshots.
+//
+// Field numbers follow the message types in transport/messages.go (the
+// hand-written wire types consensus uses internally). Translators in
+// transport/grpc convert between these proto messages and those Go
+// structs so consensus stays gRPC-agnostic.
+service RaftService {
+  rpc AppendEntries  (AppendEntriesRequest)   returns (AppendEntriesResponse);
+  rpc RequestVote    (RequestVoteRequest)     returns (RequestVoteResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// LogEntry is a single Raft log entry.
+// command is opaque to the transport: the application layer (rsm) decides
+// the encoding. raft-go's rsm uses gob, so this is gob-encoded bytes.
+message LogEntry {
+  int64 term    = 1;
+  bytes command = 2;
+}
+
+message RequestVoteRequest {
+  int64 term           = 1;
+  int32 candidate_id   = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term  = 4;
+}
+
+message RequestVoteResponse {
+  int64 term    = 1;
+  bool  success = 2;
+}
+
+message AppendEntriesRequest {
+  int64              term           = 1;
+  int32              leader_id      = 2;
+  int64              prev_log_index = 3;
+  int64              prev_log_term  = 4;
+  repeated LogEntry  entries        = 5;
+  int64              leader_commit  = 6;
+}
+
+message AppendEntriesResponse {
+  int64 term                   = 1;
+  bool  success                = 2;
+  // Fast-backup hint: the term of the conflicting entry on the follower
+  int64 entry_term             = 3;
+  // Fast-backup hint: index of the first entry in entry_term on the follower
+  int64 entry_term_start_index = 4;
+}
+
+message InstallSnapshotRequest {
+  int64 term                = 1;
+  int32 leader_id           = 2;
+  int64 last_included_index = 3;
+  int64 last_included_term  = 4;
+  bytes data                = 5;
+}
+
+message InstallSnapshotResponse {
+  int64 term = 1;
+}
