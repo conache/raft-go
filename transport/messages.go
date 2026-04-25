@@ -32,8 +32,9 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
-// AppendEntriesReply is returned by a follower. On a conflict, EntryTerm and
-// EntryTermStartIndex let the leader skip past conflicting entries faster.
+// AppendEntriesReply is returned by a follower.
+// On a conflict, EntryTerm and EntryTermStartIndex let the leader skip past
+// conflicting entries faster.
 type AppendEntriesReply struct {
 	Term    int
 	Success bool

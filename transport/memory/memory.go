@@ -75,6 +75,7 @@ type Stats struct {
 func (m *Mesh) Stats() Stats {
 	m.methodMu.Lock()
 	defer m.methodMu.Unlock()
+
 	byMethod := maps.Clone(m.methodCounts)
 	return Stats{
 		Calls:    m.totalCalls.Load(),
@@ -115,9 +116,11 @@ func NewMesh(n int, opts ...Option) *Mesh {
 		rng:          rand.New(rand.NewSource(1)),
 		methodCounts: make(map[string]int64),
 	}
+
 	for _, opt := range opts {
 		opt(m)
 	}
+
 	return m
 }
 
@@ -127,8 +130,10 @@ func (m *Mesh) Register(id int, handler any) error {
 	if id < 0 || id >= m.n {
 		return fmt.Errorf("%w: %d not in [0, %d)", ErrOutOfRange, id, m.n)
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.handlers[id] = handler
 	return nil
 }
@@ -230,6 +235,7 @@ type Peer struct {
 func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 	m := p.mesh
 
+	// Validate target reachability and apply fault injection
 	if p.to < 0 || p.to >= m.n {
 		return fmt.Errorf("%w: %d", ErrOutOfRange, p.to)
 	}
@@ -241,6 +247,7 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return ErrDropped
 	}
 
+	// Resolve handler and target method by reflection
 	handler := m.handlerFor(p.to)
 	if handler == nil {
 		return ErrNoHandler
@@ -262,6 +269,7 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 	m.methodCounts[methodName]++
 	m.methodMu.Unlock()
 
+	// Validate handler signature: (*ArgT, *ReplyT)
 	mt := methodValue.Type()
 	if mt.NumIn() != 2 {
 		return fmt.Errorf("%w: %s: want 2 params, got %d", ErrBadSignature, methodName, mt.NumIn())
@@ -278,6 +286,8 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 	}
 	replyCopy := reflect.New(mt.In(1).Elem())
 
+	// Dispatch in a goroutine so a callee mutex can't deadlock the caller;
+	// honor ctx for cancellation
 	done := make(chan error, 1)
 	go func() {
 		defer func() {
@@ -298,10 +308,12 @@ func (p *Peer) Call(ctx context.Context, method string, args, reply any) error {
 		return ctx.Err()
 	}
 
+	// Round-trip reply back into the caller's buffer
 	replyBytes, err := gobRoundTrip(replyCopy.Interface(), reply)
 	if err != nil {
 		return fmt.Errorf("memory: decoding reply: %w", err)
 	}
+
 	m.totalBytes.Add(int64(argBytes + replyBytes))
 	return nil
 }
@@ -313,6 +325,7 @@ func gobRoundTrip(src, dst any) (int, error) {
 	if err := gob.NewEncoder(&buf).Encode(src); err != nil {
 		return 0, err
 	}
+
 	n := buf.Len()
 	if err := gob.NewDecoder(&buf).Decode(dst); err != nil {
 		return n, err

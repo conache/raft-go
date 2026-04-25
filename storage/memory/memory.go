@@ -24,6 +24,7 @@ func New() *Store {
 func (s *Store) Save(state, snapshot []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.state = cloneBytes(state)
 	if snapshot != nil {
 		s.snapshot = cloneBytes(snapshot)
@@ -58,6 +59,7 @@ func (s *Store) StateSize() int {
 func (s *Store) Clone() *Store {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return &Store{
 		state:    cloneBytes(s.state),
 		snapshot: cloneBytes(s.snapshot),
@@ -68,6 +70,7 @@ func cloneBytes(b []byte) []byte {
 	if b == nil {
 		return nil
 	}
+
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out

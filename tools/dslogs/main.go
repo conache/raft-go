@@ -75,11 +75,12 @@ func main() {
 
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 1<<16), 1<<20)
-
 	panicSeen := false
+
 	for scanner.Scan() {
 		processLine(scanner.Text(), cfg, allowed, width, &panicSeen)
 	}
+
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "dslogs: read:", err)
 		os.Exit(3)
@@ -147,6 +148,7 @@ func buildAllowed(just, ignore string) (map[string]bool, error) {
 		allowed[t] = true
 	}
 	allowed["TEST"] = true
+
 	if ignore != "" {
 		for _, t := range strings.Split(ignore, ",") {
 			t = strings.TrimSpace(t)
@@ -159,9 +161,9 @@ func buildAllowed(just, ignore string) (map[string]bool, error) {
 	return allowed, nil
 }
 
-// terminalWidth returns the terminal's column count. It prefers a direct
-// TIOCGWINSZ query on stdout, falls back to COLUMNS env var, and finally to
-// a hardcoded 120.
+// terminalWidth returns the terminal's column count.
+// It prefers a direct TIOCGWINSZ query on stdout, falls back to COLUMNS
+// env var, and finally to a hardcoded 120.
 func terminalWidth() int {
 	if w := ttyColumns(); w > 0 {
 		return w
@@ -178,13 +180,12 @@ func terminalWidth() int {
 func processLine(line string, cfg config, allowed map[string]bool, width int, panicSeen *bool) {
 	trimmed := strings.TrimSpace(line)
 	fields := strings.SplitN(trimmed, " ", 3)
-
 	if len(fields) < 3 {
 		handleUnparseable(line, cfg, width, panicSeen)
 		return
 	}
-	time, topic, msg := fields[0], fields[1], fields[2]
 
+	time, topic, msg := fields[0], fields[1], fields[2]
 	if !allowed[topic] {
 		return
 	}
