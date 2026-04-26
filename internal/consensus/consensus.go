@@ -766,7 +766,7 @@ func (n *Node) callWithTimeout(fn func() bool) bool {
 func (n *Node) sendRequestVote(server int, args *transport.RequestVoteArgs, reply *transport.RequestVoteReply) bool {
 	return n.callWithTimeout(
 		func() bool {
-			return n.peers[server].Call(context.Background(), "Raft.RequestVote", args, reply) == nil
+			return n.peers[server].Call(context.Background(), transport.MethodRequestVote, args, reply) == nil
 		},
 	)
 }
@@ -778,7 +778,7 @@ func (n *Node) sendAppendEntries(
 ) bool {
 	return n.callWithTimeout(
 		func() bool {
-			return n.peers[server].Call(context.Background(), "Raft.AppendEntries", args, reply) == nil
+			return n.peers[server].Call(context.Background(), transport.MethodAppendEntries, args, reply) == nil
 		},
 	)
 }
@@ -790,7 +790,7 @@ func (n *Node) sendInstallSnapshot(
 ) bool {
 	return n.callWithTimeout(
 		func() bool {
-			return n.peers[server].Call(context.Background(), "Raft.InstallSnapshot", args, reply) == nil
+			return n.peers[server].Call(context.Background(), transport.MethodInstallSnapshot, args, reply) == nil
 		},
 	)
 }

@@ -34,14 +34,21 @@ const (
 	ErrWrongLeader Err = "ErrWrongLeader"
 )
 
-// Raft is the consensus surface RSM needs from the underlying peer.
-// *consensus.Node satisfies this interface.
+// Raft is the full consensus surface backing an RSM
+// *consensus.Node satisfies this interface
+// rsm itself only calls the proposal/snapshot side; the RPC handlers
+// (AppendEntries, RequestVote, InstallSnapshot) are exposed so a transport
+// (e.g. transport/grpc) can register the same value as its inbound handler
 type Raft interface {
 	Start(command any) (int, int, bool)
 	GetState() (int, bool)
 	Snapshot(index int, snapshot []byte)
 	PersistBytes() int
 	Kill()
+
+	AppendEntries(args *transport.AppendEntriesArgs, reply *transport.AppendEntriesReply)
+	RequestVote(args *transport.RequestVoteArgs, reply *transport.RequestVoteReply)
+	InstallSnapshot(args *transport.InstallSnapshotArgs, reply *transport.InstallSnapshotReply)
 }
 
 type UID int
