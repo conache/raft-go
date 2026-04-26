@@ -1,0 +1,37 @@
+services:
+  raft-0:
+    build: .
+    image: raft-go:latest
+    container_name: raft-0
+    networks: [raftnet]
+    ports: ["18001:8000"]
+    command:
+      - "--id=0"
+      - "--raft=raft-0:7000,raft-1:7000,raft-2:7000"
+      - "--http=:8000"
+
+  raft-1:
+    image: raft-go:latest
+    container_name: raft-1
+    networks: [raftnet]
+    ports: ["18002:8000"]
+    depends_on: [raft-0]
+    command:
+      - "--id=1"
+      - "--raft=raft-0:7000,raft-1:7000,raft-2:7000"
+      - "--http=:8000"
+
+  raft-2:
+    image: raft-go:latest
+    container_name: raft-2
+    networks: [raftnet]
+    ports: ["18003:8000"]
+    depends_on: [raft-0]
+    command:
+      - "--id=2"
+      - "--raft=raft-0:7000,raft-1:7000,raft-2:7000"
+      - "--http=:8000"
+
+networks:
+  raftnet:
+    driver: bridge
